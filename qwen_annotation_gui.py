@@ -12,6 +12,9 @@ import gradio as gr
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+import pdf_utils
+import tiling
+
 OLLAMA_API = "http://127.0.0.1:11434/api/chat"
 DEFAULT_MODEL = "qwen3-vl:4b"
 DEFAULT_CONTEXT_SIZE = 4096
@@ -28,8 +31,15 @@ Gib ausschließlich gültiges JSON in diesem Format zurück:
 Die Koordinaten müssen auf 0 bis 1000 normalisiert sein. Jede Textzeile erhält
 eine eigene, möglichst eng anliegende Box. Ergänze keine unsichtbaren Wörter.
 Zahlen, Namen und Einheiten nicht plausibilisieren. Unleserliches als
-[unleserlich], unsichere Wörter mit [?]. confidence ist high, medium oder low.
-Keine Markdown-Blöcke und keine Erläuterungen ausgeben.
+[unleserlich], unsichere Wörter mit [?]. Ignoriere automatisch vom Scanner
+oder der Scan-Software hinzugefügte Elemente wie Wasserzeichen, Stempel,
+Zeitstempel, Seiten- oder Dateinummern und Softwarehinweise am Rand; sie
+gehören nicht zum handschriftlichen Original und werden nicht als Textzeile
+erfasst. Gib dazu keine Erklärungen, Ablehnungen oder Hinweise zu
+Urheberrecht, Lizenzen oder Impressum aus. Diese Anfrage ist für ein privates
+Handschrift-Digitalisierungsprojekt und enthält keine echten Rechtsdokumente.
+confidence ist high, medium oder low. Keine Markdown-Blöcke und keine
+Erläuterungen ausgeben.
 """.strip()
 
 TRAINING_PROMPT = """
@@ -38,6 +48,10 @@ Gib ausschließlich gültiges JSON mit einer Liste namens lines aus. Jeder
 Eintrag enthält bbox_1000 als [x1,y1,x2,y2] und text. Die Koordinaten sind auf
 0 bis 1000 normalisiert. Sortiere in natürlicher Leserichtung, ergänze keine
 nicht sichtbaren Wörter und markiere Unleserliches mit [unleserlich].
+Ignoriere automatisch vom Scanner oder der Scan-Software hinzugefügte Elemente
+wie Wasserzeichen, Stempel, Zeitstempel, Seiten- oder Dateinummern und
+Softwarehinweise am Rand; sie gehören nicht zum handschriftlichen Original und
+werden nicht als Textzeile erfasst.
 """.strip()
 
 
@@ -348,6 +362,45 @@ def start_preannotation(image_path: str | None, model: str, context: int):
         raise gr.Error(str(exc)) from exc
 
 
+def load_pdf_page(pdf_path: str | None, page_number: float | int | None) -> tuple[str, str]:
+    if not pdf_path:
+        raise gr.Error("Bitte zuerst ein PDF auswählen.")
+    try:
+        pages = pdf_utils.extract_pdf_pages(pdf_path, dpi=pdf_utils.DEFAULT_PDF_DPI)
+    except Exception as exc:
+        raise gr.Error(f"PDF konnte nicht gelesen werden: {exc}") from exc
+    index = clamp(int(page_number or 1), 1, len(pages)) - 1
+    return str(pages[index]), f"Seite {index + 1} von {len(pages)} aus PDF geladen."
+
+
+def split_into_tiles(image_path: str | None) -> tuple[list[str], str]:
+    """Teilt ein großformatiges Bild in Kacheln und speichert jede einzeln.
+
+    Jede Kachel wird anschließend wie ein eigenständiger Scan geladen,
+    vorannotiert, korrigiert und gespeichert.
+    """
+    if not image_path:
+        raise gr.Error("Bitte zuerst einen Scan laden.")
+    try:
+        source = Path(image_path)
+        image = open_scan(source)
+        tiles = tiling.create_tiles(image)
+        if len(tiles) == 1:
+            return [], "Bild ist klein genug, keine Aufteilung nötig."
+        tile_dir = source.with_name(f"{source.stem}_tiles")
+        paths = tiling.save_tiles(tiles, tile_dir, source.stem)
+    except Exception as exc:
+        raise gr.Error(f"Aufteilen fehlgeschlagen: {exc}") from exc
+    return [str(p) for p in paths], f"In {len(paths)} Kacheln aufgeteilt und in {tile_dir} gespeichert."
+
+
+def load_tile(tile_paths: list[str], tile_number: float | int | None) -> tuple[str, str]:
+    if not tile_paths:
+        raise gr.Error("Bitte zuerst in Kacheln aufteilen.")
+    index = clamp(int(tile_number or 1), 1, len(tile_paths)) - 1
+    return tile_paths[index], f"Kachel {index + 1} von {len(tile_paths)} geladen."
+
+
 def load_annotation(image_path: str | None, json_path: str | None):
     if not image_path or not json_path:
         raise gr.Error("Bitte Scan und Annotations-JSON auswählen.")
@@ -508,10 +561,19 @@ def build_interface() -> gr.Blocks:
         annotation_state = gr.State({})
         image_state = gr.State("")
         selected_state = gr.State(-1)
+        tile_paths_state = gr.State([])
         gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.")
         with gr.Row():
             with gr.Column(scale=1):
                 image = gr.Image(label="Originalscan", type="filepath", sources=["upload"])
+                with gr.Row():
+                    pdf_upload = gr.File(label="PDF-Scan (mehrseitig)", file_types=[".pdf"], type="filepath")
+                    pdf_page = gr.Number(label="Seite", value=1, precision=0, minimum=1)
+                pdf_load = gr.Button("PDF-Seite laden")
+                with gr.Row():
+                    split_button = gr.Button("Originalscan in Kacheln aufteilen")
+                    tile_number = gr.Number(label="Kachel", value=1, precision=0, minimum=1)
+                load_tile_button = gr.Button("Kachel laden")
                 model = gr.Textbox(label="Ollama-Modell", value=DEFAULT_MODEL)
                 context = gr.Number(label="Kontextgröße", value=DEFAULT_CONTEXT_SIZE, precision=0)
                 preannotate = gr.Button("Qwen-Vorannotation starten", variant="primary")
@@ -533,6 +595,9 @@ def build_interface() -> gr.Blocks:
             training_file = gr.File(label="Qwen-Trainings-JSONL")
         status = gr.Textbox(label="Status", interactive=False)
 
+        pdf_load.click(load_pdf_page, [pdf_upload, pdf_page], [image, status])
+        split_button.click(split_into_tiles, [image], [tile_paths_state, status])
+        load_tile_button.click(load_tile, [tile_paths_state, tile_number], [image, status])
         preannotate.click(start_preannotation, [image, model, context], [annotation_state, image_state, selected_state, preview, crop, table, status])
         load.click(load_annotation, [image, existing], [annotation_state, image_state, selected_state, preview, crop, table, status])
         table.select(select_row, [table, annotation_state, image_state], [annotation_state, preview, crop, selected_state, status])

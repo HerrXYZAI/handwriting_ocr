@@ -5,18 +5,18 @@ import base64
 import io
 import json
 import logging
-import math
 import os
 import re
 import sys
 import time
-from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 import requests
 from PIL import Image, ImageOps
+
+import pdf_utils
+from tiling import Tile, create_tiles, save_tiles
 
 OLLAMA_API = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434/api/chat")
 DEFAULT_MODEL = "qwen3-vl:4b"
@@ -34,18 +34,18 @@ und sind auf 0 bis 1000 normalisiert. Die Box soll die gesamte sichtbare Zeile
 möglichst eng umschließen. Sortiere von oben nach unten, dann von links nach
 rechts. Ergänze keine nicht sichtbaren Wörter. Zahlen, Namen und Einheiten nicht
 plausibilisieren. Unleserliches als [unleserlich], Unsicheres mit [?] markieren.
+Ignoriere automatisch vom Scanner oder der Scan-Software hinzugefügte Elemente
+wie Wasserzeichen, Stempel, Zeitstempel, Seiten- oder Dateinummern und
+Softwarehinweise am Rand; sie gehören nicht zum handschriftlichen Original und
+werden nicht als Textzeile erfasst. Gib dazu keine Erklärungen, Ablehnungen
+oder Hinweise zu Urheberrecht, Lizenzen oder Impressum aus. Diese Anfrage ist
+für ein privates Handschrift-Digitalisierungsprojekt und enthält keine echten
+Rechtsdokumente.
 confidence darf nur high, medium oder low sein. Keine Markdown-Codeblöcke und
 keine Erläuterungen ausgeben.
 """.strip()
 
 LOG = logging.getLogger("qwen_preannotate")
-
-
-@dataclass(frozen=True)
-class Tile:
-    index: int
-    box: tuple[int, int, int, int]
-    image: Image.Image
 
 
 def configure_logging(log_file: Path, verbose: bool = False) -> None:
@@ -67,18 +67,38 @@ def configure_logging(log_file: Path, verbose: bool = False) -> None:
     LOG.addHandler(file_handler)
 
 
-class OllamaLineLogger:
-    """Sammelt Streaming-Fragmente und protokolliert fertige Textzeilen."""
+def is_repeating(lines: list[str], min_cycles: int = 15, max_period: int = 4) -> bool:
+    """Erkennt, ob die letzten Zeilen sich als kurzer Zyklus endlos wiederholen."""
+    for period in range(1, max_period + 1):
+        window = period * min_cycles
+        if len(lines) < window:
+            continue
+        tail = lines[-window:]
+        cycle = tail[:period]
+        if all(tail[i] == cycle[i % period] for i in range(window)):
+            return True
+    return False
 
-    def __init__(self) -> None:
+
+class RepetitionLoopError(RuntimeError):
+    pass
+
+
+class OllamaLineLogger:
+    """Sammelt Streaming-Fragmente, protokolliert fertige Textzeilen und bricht bei Wiederholungsschleifen ab."""
+
+    def __init__(self, tag: str = "OLLAMA") -> None:
+        self.tag = tag
         self.buffer = ""
         self.line_number = 0
+        self.recent_lines: list[str] = []
 
     def feed(self, fragment: str) -> None:
         self.buffer += fragment.replace("\r\n", "\n").replace("\r", "\n")
         while "\n" in self.buffer:
             line, self.buffer = self.buffer.split("\n", 1)
             self._write(line)
+            self._check_repetition(line)
 
     def flush(self) -> None:
         if self.buffer:
@@ -87,7 +107,18 @@ class OllamaLineLogger:
 
     def _write(self, line: str) -> None:
         self.line_number += 1
-        LOG.info("OLLAMA %04d | %s", self.line_number, line)
+        LOG.info("%s %04d | %s", self.tag, self.line_number, line)
+
+    def _check_repetition(self, line: str) -> None:
+        stripped = line.strip()
+        if not stripped:
+            return
+        self.recent_lines.append(stripped)
+        del self.recent_lines[:-64]
+        if is_repeating(self.recent_lines):
+            raise RepetitionLoopError(
+                f"Modell wiederholt sich endlos ({self.tag}); Abschnitt abgebrochen."
+            )
 
 
 def extract_json(raw: str) -> dict[str, Any]:
@@ -123,37 +154,6 @@ def open_scan(path: Path) -> Image.Image:
         return ImageOps.exif_transpose(source).convert("RGB")
 
 
-def calculate_starts(length: int, tile_size: int, overlap: float) -> list[int]:
-    if length <= tile_size:
-        return [0]
-    stride = max(1, round(tile_size * (1.0 - overlap)))
-    count = max(2, math.ceil((length - tile_size) / stride) + 1)
-    starts: list[int] = []
-    for index in range(count):
-        start = min(index * stride, length - tile_size)
-        if not starts or start != starts[-1]:
-            starts.append(start)
-    return starts
-
-
-def create_tiles(image: Image.Image, tile_trigger: int, tile_size: int, overlap: float) -> list[Tile]:
-    width, height = image.size
-    if max(width, height) <= tile_trigger:
-        return [Tile(1, (0, 0, width, height), image.copy())]
-    x_starts = calculate_starts(width, tile_size, overlap) if width > tile_trigger else [0]
-    y_starts = calculate_starts(height, tile_size, overlap) if height > tile_trigger else [0]
-    crop_width = min(width, tile_size) if width > tile_trigger else width
-    crop_height = min(height, tile_size) if height > tile_trigger else height
-    tiles: list[Tile] = []
-    index = 1
-    for y in y_starts:
-        for x in x_starts:
-            box = (x, y, min(width, x + crop_width), min(height, y + crop_height))
-            tiles.append(Tile(index, box, image.crop(box)))
-            index += 1
-    return tiles
-
-
 def scale_for_model(image: Image.Image, max_side: int, upscale: bool) -> Image.Image:
     width, height = image.size
     factor = min(max_side / width, max_side / height)
@@ -177,6 +177,18 @@ def format_duration_ns(value: Any) -> str:
         return f"{float(value) / 1_000_000_000:.2f} s"
     except (TypeError, ValueError):
         return str(value)
+
+
+def stop_ollama_model(model: str) -> None:
+    """Erzwingt über die Ollama-API das sofortige Entladen des Modells (keep_alive=0),
+    damit eine hängende oder in einer Schleife feststeckende Generierung wirklich beendet
+    wird, statt sich nur auf das Schließen der Python-Verbindung zu verlassen."""
+    generate_api = OLLAMA_API.rsplit("/", 1)[0] + "/generate"
+    try:
+        requests.post(generate_api, json={"model": model, "keep_alive": 0}, timeout=10)
+        LOG.warning("Ollama-Modell '%s' über die API zum sofortigen Entladen angefordert (%s).", model, generate_api)
+    except Exception as error:
+        LOG.warning("Ollama-Modell '%s' konnte nicht über die API gestoppt werden: %s", model, error)
 
 
 def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_index: int) -> dict[str, Any]:
@@ -203,9 +215,12 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
 
     started = time.monotonic()
     fragments: list[str] = []
-    line_logger = OllamaLineLogger()
+    thinking_fragments: list[str] = []
+    line_logger = OllamaLineLogger("OLLAMA")
+    thinking_logger = OllamaLineLogger("DENKEN")
     final_message: dict[str, Any] = {}
     first_fragment_seen = False
+    first_thinking_seen = False
 
     try:
         with requests.post(OLLAMA_API, json=payload, stream=True, timeout=(30, timeout)) as response:
@@ -220,16 +235,27 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
                     raise RuntimeError("Ollama lieferte ungültiges Streaming-JSON.") from error
                 if "error" in event:
                     raise RuntimeError(f"Ollama-Fehler: {event['error']}")
-                fragment = str(event.get("message", {}).get("content", ""))
+                message = event.get("message", {})
+                fragment = str(message.get("content", ""))
                 if fragment:
                     if not first_fragment_seen:
                         LOG.info("Erstes Antwortfragment nach %.2f s empfangen", time.monotonic() - started)
                         first_fragment_seen = True
                     fragments.append(fragment)
                     line_logger.feed(fragment)
+                thinking = str(message.get("thinking", ""))
+                if thinking:
+                    if not first_thinking_seen:
+                        LOG.info("Erstes Denkfragment (thinking) nach %.2f s empfangen", time.monotonic() - started)
+                        first_thinking_seen = True
+                    thinking_fragments.append(thinking)
+                    thinking_logger.feed(thinking)
                 if event.get("done"):
                     final_message = event
                     break
+    except RepetitionLoopError:
+        stop_ollama_model(model)
+        raise
     except requests.exceptions.ConnectionError as error:
         raise RuntimeError(
             f"Ollama ist unter {OLLAMA_API} nicht erreichbar. "
@@ -239,10 +265,22 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
         raise RuntimeError(f"Timeout beim Zugriff auf Ollama ({OLLAMA_API}).") from error
     finally:
         line_logger.flush()
+        thinking_logger.flush()
 
     raw_content = "".join(fragments)
     if not raw_content:
-        raise RuntimeError("Ollama hat keine Textantwort geliefert.")
+        LOG.error("Kein content-Fragment empfangen. Letztes Ereignis: %s", json.dumps(final_message, ensure_ascii=False))
+        if thinking_fragments:
+            LOG.error(
+                "Es wurden nur %d Denkfragment(e) (thinking) empfangen, aber kein content. "
+                "Das Modell hat vermutlich das Kontextlimit während des Denkens erreicht oder "
+                "unterstützt format=json nicht zuverlässig.",
+                len(thinking_fragments),
+            )
+        raise RuntimeError(
+            "Ollama hat keine Textantwort geliefert (siehe Log für das letzte Ereignis "
+            "und ggf. empfangene Denkfragmente)."
+        )
     LOG.info("Ollama-Antwort für Abschnitt %d abgeschlossen: %.2f s", tile_index, time.monotonic() - started)
     for key in ("prompt_eval_count", "eval_count"):
         if key in final_message:
@@ -253,143 +291,151 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
     return extract_json(raw_content)
 
 
-def local_to_global_bbox(local_bbox: list[int], tile_box: tuple[int, int, int, int], page_width: int, page_height: int) -> tuple[list[int], list[int]]:
-    """Rechnet Modell-Boxen über das unskalierte Original-Tile in Originalpixel um."""
-    tx1, ty1, tx2, ty2 = tile_box
-    tile_width, tile_height = tx2 - tx1, ty2 - ty1
-    lx1, ly1, lx2, ly2 = local_bbox
-    pixel_box = [
-        round(tx1 + lx1 / 1000 * tile_width),
-        round(ty1 + ly1 / 1000 * tile_height),
-        round(tx1 + lx2 / 1000 * tile_width),
-        round(ty1 + ly2 / 1000 * tile_height),
+def local_bbox_to_pixels(local_bbox: list[int], width: int, height: int) -> list[int]:
+    """Rechnet eine 0-1000-normalisierte Box in Originalpixel der Kachel um."""
+    x1, y1, x2, y2 = local_bbox
+    return [
+        round(x1 / 1000 * width),
+        round(y1 / 1000 * height),
+        round(x2 / 1000 * width),
+        round(y2 / 1000 * height),
     ]
-    px1, py1, px2, py2 = pixel_box
-    global_1000 = [
-        clamp(round(px1 / page_width * 1000), 0, 1000),
-        clamp(round(py1 / page_height * 1000), 0, 1000),
-        clamp(round(px2 / page_width * 1000), 0, 1000),
-        clamp(round(py2 / page_height * 1000), 0, 1000),
-    ]
-    return pixel_box, global_1000
 
 
-def intersection_over_union(a: list[int], b: list[int]) -> float:
-    x1, y1 = max(a[0], b[0]), max(a[1], b[1])
-    x2, y2 = min(a[2], b[2]), min(a[3], b[3])
-    intersection = max(0, x2 - x1) * max(0, y2 - y1)
-    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
-    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
-    union = area_a + area_b - intersection
-    return intersection / union if union else 0.0
+def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Fragt Qwen für eine Kachel ab und liefert deren Zeilen in kachellokalen Pixelkoordinaten."""
+    prepared = scale_for_model(tile.image, args.max_side, args.upscale)
+    LOG.info("Abschnitt %d: Bereich %s, Modellbild %d x %d", tile.index, tile.box, prepared.width, prepared.height)
+    result = call_qwen(prepared, args.model, args.ctx, args.timeout, tile.index)
+    raw_lines = result.get("lines", [])
+    if not isinstance(raw_lines, list):
+        raise ValueError('Antwort enthält keine Liste "lines".')
 
-
-def vertical_overlap(a: list[int], b: list[int]) -> float:
-    overlap = max(0, min(a[3], b[3]) - max(a[1], b[1]))
-    smaller = min(max(1, a[3] - a[1]), max(1, b[3] - b[1]))
-    return overlap / smaller
-
-
-def text_similarity(a: str, b: str) -> float:
-    return SequenceMatcher(None, a.casefold().strip(), b.casefold().strip()).ratio()
-
-
-def is_duplicate(candidate: dict[str, Any], existing: dict[str, Any]) -> bool:
-    a, b = candidate["bbox_pixels"], existing["bbox_pixels"]
-    if intersection_over_union(a, b) >= 0.35:
-        return True
-    return vertical_overlap(a, b) >= 0.70 and text_similarity(candidate["text"], existing["text"]) >= 0.72
-
-
-def confidence_rank(value: str) -> int:
-    return {"low": 0, "medium": 1, "high": 2}.get(value, 0)
-
-
-def merge_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: list[dict[str, Any]] = []
-    for candidate in lines:
-        duplicate_index = next((i for i, old in enumerate(merged) if is_duplicate(candidate, old)), None)
-        if duplicate_index is None:
-            merged.append(candidate)
+    tile_width, tile_height = tile.image.size
+    lines: list[dict[str, Any]] = []
+    for raw_line in raw_lines:
+        if not isinstance(raw_line, dict):
             continue
-        old = merged[duplicate_index]
-        old_score = (confidence_rank(old["confidence"]), len(old["text"]))
-        new_score = (confidence_rank(candidate["confidence"]), len(candidate["text"]))
-        if new_score > old_score:
-            merged[duplicate_index] = candidate
-    merged.sort(key=lambda line: (line["bbox_pixels"][1], line["bbox_pixels"][0]))
-    for index, line in enumerate(merged, 1):
+        try:
+            local_bbox = validate_local_bbox(raw_line.get("bbox_1000", raw_line.get("bbox")))
+        except (TypeError, ValueError) as error:
+            LOG.warning("Zeile wegen ungültiger Box übersprungen: %s", error)
+            continue
+        text = str(raw_line.get("text", "")).strip()
+        if not text:
+            continue
+        confidence = str(raw_line.get("confidence", "low")).lower().strip()
+        if confidence not in {"high", "medium", "low"}:
+            confidence = "low"
+        lines.append({
+            "id": "",
+            "bbox_pixels": local_bbox_to_pixels(local_bbox, tile_width, tile_height),
+            "bbox_1000": local_bbox,
+            "text": text,
+            "confidence": confidence,
+        })
+    LOG.info("Abschnitt %d: %d gültige Zeilen übernommen", tile.index, len(lines))
+    return lines
+
+
+def finalize_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ordered = sorted(lines, key=lambda line: (line["bbox_pixels"][1], line["bbox_pixels"][0]))
+    for index, line in enumerate(ordered, 1):
         line["id"] = f"line_{index:04d}"
-    return merged
+    return ordered
 
 
-def process_scan(args: argparse.Namespace) -> Path:
-    source = Path(args.image).resolve()
-    if not source.is_file():
-        raise FileNotFoundError(f"Bild nicht gefunden: {source}")
+def build_processing_block(args: argparse.Namespace, log_file: Path, tile_count: int) -> dict[str, Any]:
+    return {
+        "model": args.model,
+        "context_size": args.ctx,
+        "max_model_image_side": args.max_side,
+        "tile_trigger": args.tile_trigger,
+        "tile_size": args.tile_size,
+        "tile_overlap": args.overlap,
+        "tile_count": tile_count,
+        "ollama_api": OLLAMA_API,
+        "streaming": True,
+        "log_file": str(log_file),
+    }
+
+
+def resolve_page_paths(args: argparse.Namespace, source: Path) -> tuple[Path, Path]:
     output = Path(args.output).resolve() if args.output else source.with_name(source.stem + "_preannotation.json")
     log_file = Path(args.log_file).resolve() if args.log_file else source.with_name(source.stem + "_preannotation.log")
-    configure_logging(log_file, args.verbose)
-    LOG.info("Start: %s", source)
-    LOG.info("Ollama API: %s", OLLAMA_API)
+    return output, log_file
 
+
+def process_scan(args: argparse.Namespace) -> list[Path]:
+    source = Path(args.image).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"Datei nicht gefunden: {source}")
+
+    if pdf_utils.is_pdf(source):
+        pages = pdf_utils.extract_pdf_pages(source, dpi=args.pdf_dpi)
+        if not pages:
+            raise ValueError(f"PDF enthält keine Seiten: {source}")
+        if len(pages) > 1 and (args.output or args.log_file):
+            raise SystemExit(
+                "--output und --log-file sind bei mehrseitigen PDFs nicht zulässig; "
+                "Dateinamen werden automatisch je Seite vergeben."
+            )
+        outputs: list[Path] = []
+        for page in pages:
+            outputs.extend(process_page(args, page))
+        return outputs
+
+    return process_page(args, source)
+
+
+def process_page(args: argparse.Namespace, source: Path) -> list[Path]:
+    """Verarbeitet eine einzelne Bild-/PDF-Seitendatei.
+
+    Wird die Seite in mehrere Abschnitte aufgeteilt, wird jeder Abschnitt als
+    eigenständiges Bild samt eigener Annotation gespeichert, statt sie zu
+    einer Seitenannotation zusammenzuführen.
+    """
     image = open_scan(source)
     page_width, page_height = image.size
     tiles = create_tiles(image, args.tile_trigger, args.tile_size, args.overlap)
-    tile_directory: Path | None = None
-    if args.save_tiles:
-        tile_directory = source.parent / f"{source.stem}_tiles"
-        tile_directory.mkdir(exist_ok=True)
 
-    collected: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
+    if len(tiles) > 1 and (args.output or args.log_file):
+        raise SystemExit(
+            "--output und --log-file sind nicht zulässig, wenn ein Bild in mehrere "
+            "Abschnitte aufgeteilt wird; Dateinamen werden automatisch je Abschnitt vergeben."
+        )
+
+    output, log_file = resolve_page_paths(args, source)
+    configure_logging(log_file, args.verbose)
+    LOG.info("Start: %s", source)
+    LOG.info("Ollama API: %s", OLLAMA_API)
     LOG.info("Bild: %d x %d Pixel", page_width, page_height)
     LOG.info("Verarbeitung in %d Abschnitt(en)", len(tiles))
 
-    for tile in tiles:
-        prepared = scale_for_model(tile.image, args.max_side, args.upscale)
-        LOG.info("[%d/%d] Bereich %s, Modellbild %d x %d", tile.index, len(tiles), tile.box, prepared.width, prepared.height)
-        if tile_directory:
-            tile_path = tile_directory / f"tile_{tile.index:03d}.jpg"
-            prepared.save(tile_path, quality=92)
-        try:
-            result = call_qwen(prepared, args.model, args.ctx, args.timeout, tile.index)
-            raw_lines = result.get("lines", [])
-            if not isinstance(raw_lines, list):
-                raise ValueError('Antwort enthält keine Liste "lines".')
-            accepted = 0
-            for raw_line in raw_lines:
-                if not isinstance(raw_line, dict):
-                    continue
-                try:
-                    local_bbox = validate_local_bbox(raw_line.get("bbox_1000", raw_line.get("bbox")))
-                except (TypeError, ValueError) as error:
-                    LOG.warning("Zeile wegen ungültiger Box übersprungen: %s", error)
-                    continue
-                bbox_pixels, bbox_1000 = local_to_global_bbox(local_bbox, tile.box, page_width, page_height)
-                confidence = str(raw_line.get("confidence", "low")).lower().strip()
-                if confidence not in {"high", "medium", "low"}:
-                    confidence = "low"
-                text = str(raw_line.get("text", "")).strip()
-                if not text:
-                    continue
-                collected.append({
-                    "id": "",
-                    "bbox_pixels": bbox_pixels,
-                    "bbox_1000": bbox_1000,
-                    "text": text,
-                    "confidence": confidence,
-                    "source_tile": tile.index,
-                })
-                accepted += 1
-            LOG.info("Abschnitt %d: %d gültige Zeilen übernommen", tile.index, accepted)
-        except Exception as error:
-            errors.append({"tile": tile.index, "box": list(tile.box), "error": str(error)})
-            LOG.exception("Fehler in Abschnitt %d: %s", tile.index, error)
-            if not args.continue_on_error:
-                raise
+    if len(tiles) == 1:
+        return [process_untiled_page(args, source, output, log_file, tiles[0], page_width, page_height)]
+    return process_tiled_page(args, source, log_file, tiles, page_width, page_height)
 
-    final_lines = merge_lines(collected)
+
+def process_untiled_page(
+    args: argparse.Namespace,
+    source: Path,
+    output: Path,
+    log_file: Path,
+    tile: Tile,
+    page_width: int,
+    page_height: int,
+) -> Path:
+    errors: list[dict[str, Any]] = []
+    try:
+        lines = finalize_lines(run_tile(tile, args))
+    except Exception as error:
+        errors.append({"tile": tile.index, "box": list(tile.box), "error": str(error)})
+        LOG.exception("Fehler in Abschnitt %d: %s", tile.index, error)
+        if not args.continue_on_error:
+            raise
+        lines = []
+
     document = {
         "schema_version": "1.3",
         "task": "handwritten_line_preannotation",
@@ -400,26 +446,69 @@ def process_scan(args: argparse.Namespace) -> Path:
             "width": page_width,
             "height": page_height,
         },
-        "processing": {
-            "model": args.model,
-            "context_size": args.ctx,
-            "max_model_image_side": args.max_side,
-            "tile_trigger": args.tile_trigger,
-            "tile_size": args.tile_size,
-            "tile_overlap": args.overlap,
-            "tile_count": len(tiles),
-            "ollama_api": OLLAMA_API,
-            "streaming": True,
-            "log_file": str(log_file),
-        },
-        "lines": final_lines,
+        "processing": build_processing_block(args, log_file, tile_count=1),
+        "lines": lines,
         "errors": errors,
     }
     output.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
     LOG.info("Gespeichert: %s", output)
-    LOG.info("Erkannte Zeilen nach Zusammenführung: %d", len(final_lines))
-    LOG.info("Fehlerhafte Abschnitte: %d", len(errors))
+    LOG.info("Erkannte Zeilen: %d", len(lines))
     return output
+
+
+def process_tiled_page(
+    args: argparse.Namespace,
+    source: Path,
+    log_file: Path,
+    tiles: list[Tile],
+    page_width: int,
+    page_height: int,
+) -> list[Path]:
+    tile_dir = source.with_name(f"{source.stem}_tiles")
+    tile_paths = save_tiles(tiles, tile_dir, source.stem)
+    outputs: list[Path] = []
+
+    for tile, tile_image_path in zip(tiles, tile_paths):
+        errors: list[dict[str, Any]] = []
+        try:
+            lines = finalize_lines(run_tile(tile, args))
+        except Exception as error:
+            errors.append({"tile": tile.index, "box": list(tile.box), "error": str(error)})
+            LOG.exception("Fehler in Abschnitt %d: %s", tile.index, error)
+            if not args.continue_on_error:
+                raise
+            lines = []
+
+        tile_width, tile_height = tile.image.size
+        tile_output_path = tile_image_path.with_name(tile_image_path.stem + "_preannotation.json")
+        document = {
+            "schema_version": "1.3",
+            "task": "handwritten_line_preannotation",
+            "coordinate_system": "original_pixels",
+            "image": {
+                "file": str(tile_image_path),
+                "file_name": tile_image_path.name,
+                "width": tile_width,
+                "height": tile_height,
+            },
+            "source": {
+                "page_file": str(source),
+                "page_width": page_width,
+                "page_height": page_height,
+                "tile_index": tile.index,
+                "tile_count": len(tiles),
+                "tile_box_in_page": list(tile.box),
+            },
+            "processing": build_processing_block(args, log_file, tile_count=len(tiles)),
+            "lines": lines,
+            "errors": errors,
+        }
+        tile_output_path.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+        LOG.info("Abschnitt %d gespeichert: %s (%d Zeilen)", tile.index, tile_output_path, len(lines))
+        outputs.append(tile_output_path)
+
+    LOG.info("Alle Abschnitte gespeichert: %d Datei(en) in %s", len(outputs), tile_dir)
+    return outputs
 
 
 def percentage(value: str) -> float:
@@ -438,17 +527,32 @@ def positive_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Qwen-VL-Vorannotation mit Ollama in Docker.")
-    parser.add_argument("image", help="PNG-, JPEG- oder anderes von Pillow unterstütztes Bild")
-    parser.add_argument("--output", help="Ausgabe-JSON; Standard: <bild>_preannotation.json")
-    parser.add_argument("--log-file", help="Logdatei; Standard: <bild>_preannotation.log")
+    parser.add_argument(
+        "image",
+        help="PNG-, JPEG-, PDF- oder anderes von Pillow unterstütztes Bild "
+        "(bei PDF wird jede Seite einzeln verarbeitet)",
+    )
+    parser.add_argument("--output", help="Ausgabe-JSON; Standard: <bild>_preannotation.json (nicht bei mehrseitigem PDF)")
+    parser.add_argument("--log-file", help="Logdatei; Standard: <bild>_preannotation.log (nicht bei mehrseitigem PDF)")
+    parser.add_argument(
+        "--pdf-dpi",
+        type=positive_int,
+        default=pdf_utils.DEFAULT_PDF_DPI,
+        help=f"Rasterauflösung für PDF-Seiten in DPI; Standard: {pdf_utils.DEFAULT_PDF_DPI}",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama-Modell; Standard: {DEFAULT_MODEL}")
     parser.add_argument("--ctx", type=positive_int, default=DEFAULT_CONTEXT, help=f"Ollama-Kontextgröße; Standard: {DEFAULT_CONTEXT}")
     parser.add_argument("--max-side", type=positive_int, default=DEFAULT_MAX_SIDE, help=f"Maximale Seitenlänge je Modellbild; Standard: {DEFAULT_MAX_SIDE}")
-    parser.add_argument("--tile-trigger", type=positive_int, default=2800, help="Ab dieser Seitenlänge wird unterteilt; Standard: 2800")
+    parser.add_argument(
+        "--tile-trigger",
+        type=positive_int,
+        default=2800,
+        help="Ab dieser Seitenlänge wird unterteilt und jeder Abschnitt einzeln als "
+        "eigene Datei mit eigener Annotation gespeichert; Standard: 2800",
+    )
     parser.add_argument("--tile-size", type=positive_int, default=2200, help="Kachelgröße in Originalpixeln; Standard: 2200")
     parser.add_argument("--overlap", type=percentage, default=0.15, help="Kachelüberlappung; Standard: 0.15")
     parser.add_argument("--upscale", action="store_true", help="Kleine Abschnitte bis max-side hochskalieren")
-    parser.add_argument("--save-tiles", action="store_true", help="An Ollama gesendete Abschnitte als JPEG speichern")
     parser.add_argument("--continue-on-error", action="store_true", help="Nach Fehler eines Abschnitts fortfahren")
     parser.add_argument("--timeout", type=positive_int, default=1800, help="Read-Timeout je Abschnitt in Sekunden; Standard: 1800")
     parser.add_argument("--verbose", action="store_true", help="Ausführlicheres Debug-Logging aktivieren")

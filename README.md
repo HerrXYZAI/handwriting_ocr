@@ -61,9 +61,43 @@ C:\Handschrift-Dataset\
 
 Als Dataset-Wurzel `C:\Handschrift-Dataset` angeben. Bilder innerhalb dieser Wurzel werden mit relativem Pfad exportiert.
 
+## PDF-Scans
+
+Sowohl die Oberfläche als auch die Kommandozeilen-Vorannotation akzeptieren PDF-Dateien
+zusätzlich zu Bilddateien. Jede PDF-Seite wird mit 300 DPI (Oberfläche fest, CLI über
+`--pdf-dpi` einstellbar) in ein PNG neben der PDF gerastert (`<pdf-name>_pages\`) und wie
+ein normaler Scan weiterverarbeitet. Bereits gerasterte Seiten werden bei erneutem Laden
+wiederverwendet.
+
+- Oberfläche: PDF über "PDF-Scan (mehrseitig)" hochladen, Seitenzahl eintragen, "PDF-Seite
+  laden" klicken. Die gerasterte Seite erscheint im Originalscan-Feld und wird wie ein
+  Bild-Upload behandelt.
+- Kommandozeile: `python qwen_preannotate.py scan.pdf` verarbeitet automatisch jede Seite
+  und schreibt `<pdf-name>_p001_preannotation.json`, `<pdf-name>_p002_preannotation.json`
+  usw. Bei mehrseitigen PDFs sind `--output`/`--log-file` nicht zulässig, da die Namen je
+  Seite automatisch vergeben werden.
+
+## Großformatige Scans (Kacheln)
+
+Übersteigt ein Bild `--tile-trigger` (Standard 2800 px Kantenlänge), wird es in
+überlappende Kacheln aufgeteilt. Jede Kachel wird als eigenständige Bilddatei in
+`<scan-name>_tiles\` gespeichert und einzeln vorannotiert bzw. annotiert – es gibt
+keine automatische Zusammenführung zu einer Seitenannotation mehr. Duplikate im
+Überlappungsbereich zweier Kacheln bleiben also als getrennte Einträge in den
+jeweiligen Kachel-Annotationen bestehen.
+
+- Oberfläche: Scan laden, "Originalscan in Kacheln aufteilen" klicken. Ist das Bild
+  klein genug, passiert nichts. Sonst werden die Kacheln gespeichert; Kachelnummer
+  eintragen und "Kachel laden" klicken, um sie wie einen eigenen Scan zu vorannotieren,
+  zu korrigieren und zu speichern.
+- Kommandozeile: `python qwen_preannotate.py scan.png` erkennt automatisch, ob eine
+  Aufteilung nötig ist, und schreibt bei Aufteilung `<scan-name>_tiles\<scan-name>_tile001_preannotation.json`
+  usw. statt einer einzelnen `<scan-name>_preannotation.json`. `--output`/`--log-file`
+  sind dann nicht zulässig, da die Namen je Kachel automatisch vergeben werden.
+
 ## Workflow
 
-1. Originalscan laden.
+1. Originalscan laden (Bild oder PDF-Seite, siehe oben).
 2. Modellnamen und Kontextgröße kontrollieren.
 3. Qwen-Vorannotation starten.
 4. Tabellenzeile auswählen und Text korrigieren.

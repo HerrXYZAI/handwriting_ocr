@@ -1,0 +1,28 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File with Arguments",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "args": "${command:pickArgs}"
+        },
+        {
+            "name": "Python Debugger: validate_annotations.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/validate_annotations.py",
+            "console": "integratedTerminal",
+            "args": [
+                "C:\\test\\handwriting_ocr\\pictures_for_OCR\\IMG_20260909_090715_mini_annotation.json",
+                "--image",
+                "C:\\test\\handwriting_ocr\\pictures_for_OCR\\IMG_20260909_090715_mini.jpg"
+            ]
+        }
+    ]
+}
