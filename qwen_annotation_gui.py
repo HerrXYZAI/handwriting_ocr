@@ -6,6 +6,8 @@ import copy
 import io
 import json
 import re
+import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,7 @@ import tiling
 OLLAMA_API = "http://127.0.0.1:11434/api/chat"
 DEFAULT_MODEL = "qwen3-vl:4b"
 DEFAULT_CONTEXT_SIZE = 4096
+DEFAULT_DATASET_ROOT = r"C:\test\handwriting_ocr\pictures_for_OCR"
 CONFIDENCE_VALUES = {"high", "medium", "low"}
 TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1_px", "y1_px", "x2_px", "y2_px"]
 
@@ -309,8 +312,22 @@ BBOX_JS = """
     qbSync({ type: 'move', id: id, bbox_pixels: [x1, y1, x2, y2] });
   }
 
+  function qbCommitActiveText() {
+    // mousedown handlers below call preventDefault() to allow dragging
+    // without also selecting page text - but that also suppresses the
+    // browser's default blur of a currently-focused textarea, so an
+    // in-progress text edit would otherwise be silently discarded when
+    // clicking straight from one box to another. Blur it explicitly first
+    // so window.qbCommitText still fires and the edit is saved.
+    const active = document.activeElement;
+    if (active && active.classList && active.classList.contains('bbox-textarea')) {
+      active.blur();
+    }
+  }
+
   window.qbStartDrag = function(evt, id) {
     if (evt.target.closest('.bbox-handle')) return;
+    qbCommitActiveText();
     evt.preventDefault();
     evt.stopPropagation();
     const box = document.getElementById('box-' + id);
@@ -346,6 +363,7 @@ BBOX_JS = """
   };
 
   window.qbStartResize = function(evt, id, corner) {
+    qbCommitActiveText();
     evt.preventDefault();
     evt.stopPropagation();
     const box = document.getElementById('box-' + id);
@@ -750,14 +768,42 @@ def sync_bbox_edit(
     )
 
 
-def save_annotation(table: Any, annotation: dict[str, Any], image_path: str, model: str):
+def ensure_image_under_dataset_root(image_path: str, dataset_root: str) -> str:
+    """Kopiert das Bild ins Dataset-Wurzelverzeichnis, falls es dort noch
+    nicht liegt (z.B. weil es als Gradio-Upload ins OS-Temp-Verzeichnis
+    kopiert wurde - "sources=[upload]" tut das immer, auch wenn die
+    Originaldatei schon lokal existiert). Temp-Verzeichnisse ueberstehen
+    keinen Neustart zuverlaessig, Annotation und train.jsonl duerfen also
+    nicht dauerhaft dorthin zeigen.
+    """
+    if not dataset_root.strip():
+        return image_path
+    image = Path(image_path).resolve()
+    root = Path(dataset_root).resolve()
+    try:
+        image.relative_to(root)
+        return str(image)
+    except ValueError:
+        pass
+    target_dir = root / "uploads"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / image.name
+    if target.exists() and not target.samefile(image):
+        target = target_dir / f"{image.stem}_{uuid.uuid4().hex[:8]}{image.suffix}"
+    if not target.exists():
+        shutil.copy2(image, target)
+    return str(target)
+
+
+def save_annotation(table: Any, annotation: dict[str, Any], image_path: str, model: str, dataset_root: str):
     if not image_path:
         raise gr.Error("Keine Annotation vorhanden.")
     try:
+        image_path = ensure_image_under_dataset_root(image_path, dataset_root)
         annotation = add_metadata(table_to_annotation(table, annotation), image_path, model)
         output = Path(image_path).with_name(Path(image_path).stem + "_annotation.json")
         output.write_text(json.dumps(annotation, ensure_ascii=False, indent=2), encoding="utf-8")
-        return annotation, str(output), f"Annotation gespeichert: {output}"
+        return annotation, str(output), f"Annotation gespeichert: {output}", image_path
     except Exception as exc:
         raise gr.Error(f"Speichern fehlgeschlagen: {exc}") from exc
 
@@ -826,6 +872,7 @@ def export_jsonl(table: Any, annotation: dict[str, Any], image_path: str, datase
     if not image_path:
         raise gr.Error("Keine Annotation vorhanden.")
     try:
+        image_path = ensure_image_under_dataset_root(image_path, dataset_root)
         annotation = table_to_annotation(table, annotation)
         record = training_record(annotation, image_path, dataset_root)
         root = Path(dataset_root).resolve() if dataset_root.strip() else Path(image_path).resolve().parent
@@ -840,7 +887,7 @@ def export_jsonl(table: Any, annotation: dict[str, Any], image_path: str, datase
             encoding="utf-8",
             newline="\n",
         )
-        return annotation, str(output), f"JSONL exportiert: {output} | {len(records)} Datensätze, aktuelle Seite {len(training_answer(annotation)['lines'])} Zeilen."
+        return annotation, str(output), f"JSONL exportiert: {output} | {len(records)} Datensätze, aktuelle Seite {len(training_answer(annotation)['lines'])} Zeilen.", image_path
     except Exception as exc:
         raise gr.Error(f"JSONL-Export fehlgeschlagen: {exc}") from exc
 
@@ -881,7 +928,7 @@ def build_interface() -> gr.Blocks:
             refresh_button = gr.Button("Änderungen übernehmen")
             save_button = gr.Button("Annotations-JSON speichern")
         with gr.Row():
-            dataset_root = gr.Textbox(label="Dataset-Wurzelverzeichnis", placeholder=r"C:\Handschrift-Dataset")
+            dataset_root = gr.Textbox(label="Dataset-Wurzelverzeichnis", value=DEFAULT_DATASET_ROOT, placeholder=r"C:\Handschrift-Dataset")
             export_mode = gr.Radio(["An Datei anhängen / Seite aktualisieren", "Datei ersetzen"], value="An Datei anhängen / Seite aktualisieren", label="Exportmodus")
             export_button = gr.Button("Als Qwen-Trainings-JSONL exportieren", variant="primary")
         with gr.Row():
@@ -906,8 +953,8 @@ def build_interface() -> gr.Blocks:
             [bbox_sync, annotation_state, image_state, selected_state, active_text_state],
             [annotation_state, preview, crop, table, selected_state, active_text_state, status],
         )
-        save_button.click(save_annotation, [table, annotation_state, image_state, model], [annotation_state, annotation_file, status])
-        export_button.click(export_jsonl, [table, annotation_state, image_state, dataset_root, export_mode], [annotation_state, training_file, status])
+        save_button.click(save_annotation, [table, annotation_state, image_state, model, dataset_root], [annotation_state, annotation_file, status, image_state])
+        export_button.click(export_jsonl, [table, annotation_state, image_state, dataset_root, export_mode], [annotation_state, training_file, status, image_state])
         app.load(None, None, None, js=BBOX_JS)
     return app
 

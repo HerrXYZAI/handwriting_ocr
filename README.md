@@ -145,3 +145,9 @@ Die Annotations-JSON bewahrt Vorhersage, Korrektur, Konfidenz, Status und Positi
 - Qwen-Ausgaben und Boxen müssen fachlich geprüft werden.
 - Namen, Zahlen, Messwerte und Einheiten besonders sorgfältig kontrollieren.
 - Ein Modell-Finetuning selbst ist nicht Bestandteil dieser Anwendung.
+
+## Finetuning der Trainings-JSONL
+
+Für ein QLoRA-Finetuning von Qwen3-VL auf der exportierten `train.jsonl`, in
+einem separaten Docker-Container mit GPU-Zugriff: siehe
+[`finetune/README.md`](finetune/README.md).
