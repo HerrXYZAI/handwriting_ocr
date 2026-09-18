@@ -6,10 +6,7 @@ import io
 import json
 import logging
 import math
-<<<<<<< HEAD
-=======
 import os
->>>>>>> 095a933 (bug fixes)
 import re
 import sys
 import time
@@ -21,37 +18,17 @@ from typing import Any
 import requests
 from PIL import Image, ImageOps
 
-<<<<<<< HEAD
-OLLAMA_API = "http://127.0.0.1:11434/api/chat"
-DEFAULT_MODEL = "qwen3-vl:8b"
-DEFAULT_CONTEXT = 4096
-=======
 OLLAMA_API = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434/api/chat")
-# DEFAULT_MODEL = "qwen3-vl:8b"
 DEFAULT_MODEL = "qwen3-vl:4b"
-# DEFAULT_CONTEXT = 4096
 DEFAULT_CONTEXT = 8192
->>>>>>> 095a933 (bug fixes)
 DEFAULT_MAX_SIDE = 1024
 
 PROMPT = """
 Analysiere diesen Bildausschnitt einer gescannten Seite mit deutscher Handschrift.
 Erkenne alle vollständig oder teilweise sichtbaren handschriftlichen Textzeilen.
 Gib ausschließlich gültiges JSON in diesem Format zurück:
-<<<<<<< HEAD
-{
-  "lines": [
-    {
-      "bbox_1000": [x1, y1, x2, y2],
-      "text": "erkannter Text",
-      "confidence": "high"
-    }
-  ]
-}
-=======
 {"lines":[{"bbox_1000":[x1,y1,x2,y2],"text":"erkannter Text","confidence":"high"}]}
 
->>>>>>> 095a933 (bug fixes)
 Die Koordinaten beziehen sich ausschließlich auf den übergebenen Bildausschnitt
 und sind auf 0 bis 1000 normalisiert. Die Box soll die gesamte sichtbare Zeile
 möglichst eng umschließen. Sortiere von oben nach unten, dann von links nach
@@ -76,32 +53,16 @@ def configure_logging(log_file: Path, verbose: bool = False) -> None:
     LOG.setLevel(level)
     LOG.handlers.clear()
     LOG.propagate = False
-<<<<<<< HEAD
-
-=======
->>>>>>> 095a933 (bug fixes)
     formatter = logging.Formatter(
         fmt="%(asctime)s | %(levelname)-8s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
-<<<<<<< HEAD
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(level)
-    console.setFormatter(formatter)
-
-    file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-
-=======
     console = logging.StreamHandler(sys.stdout)
     console.setLevel(level)
     console.setFormatter(formatter)
     file_handler = logging.FileHandler(log_file, mode="w", encoding="utf-8")
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
->>>>>>> 095a933 (bug fixes)
     LOG.addHandler(console)
     LOG.addHandler(file_handler)
 
@@ -122,11 +83,7 @@ class OllamaLineLogger:
     def flush(self) -> None:
         if self.buffer:
             self._write(self.buffer)
-<<<<<<< HEAD
-            self.buffer = ""
-=======
         self.buffer = ""
->>>>>>> 095a933 (bug fixes)
 
     def _write(self, line: str) -> None:
         self.line_number += 1
@@ -140,11 +97,7 @@ def extract_json(raw: str) -> dict[str, Any]:
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         raise ValueError("Die Modellantwort enthält kein JSON-Objekt.")
-<<<<<<< HEAD
-    result = json.loads(text[start:end + 1])
-=======
     result = json.loads(text[start : end + 1])
->>>>>>> 095a933 (bug fixes)
     if not isinstance(result, dict):
         raise ValueError("Die JSON-Wurzel muss ein Objekt sein.")
     return result
@@ -165,10 +118,7 @@ def validate_local_bbox(value: Any) -> list[int]:
 
 
 def open_scan(path: Path) -> Image.Image:
-<<<<<<< HEAD
-=======
     """Verwendet dieselbe EXIF-korrigierte Originalpixelbasis wie die GUI."""
->>>>>>> 095a933 (bug fixes)
     with Image.open(path) as source:
         return ImageOps.exif_transpose(source).convert("RGB")
 
@@ -186,31 +136,14 @@ def calculate_starts(length: int, tile_size: int, overlap: float) -> list[int]:
     return starts
 
 
-<<<<<<< HEAD
-def create_tiles(
-    image: Image.Image,
-    tile_trigger: int,
-    tile_size: int,
-    overlap: float,
-) -> list[Tile]:
-    width, height = image.size
-    if max(width, height) <= tile_trigger:
-        return [Tile(1, (0, 0, width, height), image.copy())]
-
-=======
 def create_tiles(image: Image.Image, tile_trigger: int, tile_size: int, overlap: float) -> list[Tile]:
     width, height = image.size
     if max(width, height) <= tile_trigger:
         return [Tile(1, (0, 0, width, height), image.copy())]
->>>>>>> 095a933 (bug fixes)
     x_starts = calculate_starts(width, tile_size, overlap) if width > tile_trigger else [0]
     y_starts = calculate_starts(height, tile_size, overlap) if height > tile_trigger else [0]
     crop_width = min(width, tile_size) if width > tile_trigger else width
     crop_height = min(height, tile_size) if height > tile_trigger else height
-<<<<<<< HEAD
-
-=======
->>>>>>> 095a933 (bug fixes)
     tiles: list[Tile] = []
     index = 1
     for y in y_starts:
@@ -246,17 +179,7 @@ def format_duration_ns(value: Any) -> str:
         return str(value)
 
 
-<<<<<<< HEAD
-def call_qwen(
-    image: Image.Image,
-    model: str,
-    context: int,
-    timeout: int,
-    tile_index: int,
-) -> dict[str, Any]:
-=======
 def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_index: int) -> dict[str, Any]:
->>>>>>> 095a933 (bug fixes)
     payload = {
         "model": model,
         "messages": [{
@@ -268,13 +191,6 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
         "format": "json",
         "options": {"temperature": 0, "num_ctx": context},
     }
-<<<<<<< HEAD
-
-    LOG.info(
-        "Ollama-Anfrage für Abschnitt %d: Modell=%s, Kontext=%d, Bild=%dx%d",
-        tile_index, model, context, image.width, image.height,
-    )
-=======
     LOG.info(
         "Ollama-Anfrage für Abschnitt %d: URL=%s, Modell=%s, Kontext=%d, Bild=%dx%d",
         tile_index,
@@ -285,7 +201,6 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
         image.height,
     )
 
->>>>>>> 095a933 (bug fixes)
     started = time.monotonic()
     fragments: list[str] = []
     line_logger = OllamaLineLogger()
@@ -293,41 +208,18 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
     first_fragment_seen = False
 
     try:
-<<<<<<< HEAD
-        with requests.post(
-            OLLAMA_API,
-            json=payload,
-            stream=True,
-            timeout=(30, timeout),
-        ) as response:
-            if not response.ok:
-                raise RuntimeError(
-                    f"Ollama-Fehler {response.status_code}: {response.text}"
-                )
-
-=======
         with requests.post(OLLAMA_API, json=payload, stream=True, timeout=(30, timeout)) as response:
             if not response.ok:
                 raise RuntimeError(f"Ollama-Fehler {response.status_code}: {response.text}")
->>>>>>> 095a933 (bug fixes)
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not raw_line:
                     continue
                 try:
                     event = json.loads(raw_line)
                 except json.JSONDecodeError as error:
-<<<<<<< HEAD
-                    LOG.warning("Ungültige Ollama-Streamingzeile: %r", raw_line)
-                    raise RuntimeError("Ollama lieferte ungültiges Streaming-JSON.") from error
-
-                if "error" in event:
-                    raise RuntimeError(f"Ollama-Fehler: {event['error']}")
-
-=======
                     raise RuntimeError("Ollama lieferte ungültiges Streaming-JSON.") from error
                 if "error" in event:
                     raise RuntimeError(f"Ollama-Fehler: {event['error']}")
->>>>>>> 095a933 (bug fixes)
                 fragment = str(event.get("message", {}).get("content", ""))
                 if fragment:
                     if not first_fragment_seen:
@@ -335,12 +227,6 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
                         first_fragment_seen = True
                     fragments.append(fragment)
                     line_logger.feed(fragment)
-<<<<<<< HEAD
-
-                if event.get("done"):
-                    final_message = event
-                    break
-=======
                 if event.get("done"):
                     final_message = event
                     break
@@ -351,44 +237,24 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
         ) from error
     except requests.exceptions.Timeout as error:
         raise RuntimeError(f"Timeout beim Zugriff auf Ollama ({OLLAMA_API}).") from error
->>>>>>> 095a933 (bug fixes)
     finally:
         line_logger.flush()
 
     raw_content = "".join(fragments)
     if not raw_content:
         raise RuntimeError("Ollama hat keine Textantwort geliefert.")
-<<<<<<< HEAD
-
-    elapsed = time.monotonic() - started
-    LOG.info("Ollama-Antwort für Abschnitt %d abgeschlossen: %.2f s", tile_index, elapsed)
-=======
     LOG.info("Ollama-Antwort für Abschnitt %d abgeschlossen: %.2f s", tile_index, time.monotonic() - started)
->>>>>>> 095a933 (bug fixes)
     for key in ("prompt_eval_count", "eval_count"):
         if key in final_message:
             LOG.info("Ollama-Metrik %s: %s", key, final_message[key])
     for key in ("total_duration", "load_duration", "prompt_eval_duration", "eval_duration"):
         if key in final_message:
             LOG.info("Ollama-Metrik %s: %s", key, format_duration_ns(final_message[key]))
-<<<<<<< HEAD
-
-    return extract_json(raw_content)
-
-
-def local_to_global_bbox(
-    local_bbox: list[int],
-    tile_box: tuple[int, int, int, int],
-    page_width: int,
-    page_height: int,
-) -> tuple[list[int], list[int]]:
-=======
     return extract_json(raw_content)
 
 
 def local_to_global_bbox(local_bbox: list[int], tile_box: tuple[int, int, int, int], page_width: int, page_height: int) -> tuple[list[int], list[int]]:
     """Rechnet Modell-Boxen über das unskalierte Original-Tile in Originalpixel um."""
->>>>>>> 095a933 (bug fixes)
     tx1, ty1, tx2, ty2 = tile_box
     tile_width, tile_height = tx2 - tx1, ty2 - ty1
     lx1, ly1, lx2, ly2 = local_bbox
@@ -432,14 +298,7 @@ def is_duplicate(candidate: dict[str, Any], existing: dict[str, Any]) -> bool:
     a, b = candidate["bbox_pixels"], existing["bbox_pixels"]
     if intersection_over_union(a, b) >= 0.35:
         return True
-<<<<<<< HEAD
-    return (
-        vertical_overlap(a, b) >= 0.70
-        and text_similarity(candidate["text"], existing["text"]) >= 0.72
-    )
-=======
     return vertical_overlap(a, b) >= 0.70 and text_similarity(candidate["text"], existing["text"]) >= 0.72
->>>>>>> 095a933 (bug fixes)
 
 
 def confidence_rank(value: str) -> int:
@@ -449,14 +308,7 @@ def confidence_rank(value: str) -> int:
 def merge_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     for candidate in lines:
-<<<<<<< HEAD
-        duplicate_index = next(
-            (i for i, old in enumerate(merged) if is_duplicate(candidate, old)),
-            None,
-        )
-=======
         duplicate_index = next((i for i, old in enumerate(merged) if is_duplicate(candidate, old)), None)
->>>>>>> 095a933 (bug fixes)
         if duplicate_index is None:
             merged.append(candidate)
             continue
@@ -465,10 +317,6 @@ def merge_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
         new_score = (confidence_rank(candidate["confidence"]), len(candidate["text"]))
         if new_score > old_score:
             merged[duplicate_index] = candidate
-<<<<<<< HEAD
-
-=======
->>>>>>> 095a933 (bug fixes)
     merged.sort(key=lambda line: (line["bbox_pixels"][1], line["bbox_pixels"][0]))
     for index, line in enumerate(merged, 1):
         line["id"] = f"line_{index:04d}"
@@ -479,33 +327,6 @@ def process_scan(args: argparse.Namespace) -> Path:
     source = Path(args.image).resolve()
     if not source.is_file():
         raise FileNotFoundError(f"Bild nicht gefunden: {source}")
-<<<<<<< HEAD
-
-    output = (
-        Path(args.output).resolve()
-        if args.output
-        else source.with_name(source.stem + "_preannotation.json")
-    )
-    log_file = (
-        Path(args.log_file).resolve()
-        if args.log_file
-        else source.with_name(source.stem + "_preannotation.log")
-    )
-    configure_logging(log_file, args.verbose)
-
-    LOG.info("Start: %s", source)
-    LOG.info("Logdatei: %s", log_file)
-    image = open_scan(source)
-    page_width, page_height = image.size
-    tiles = create_tiles(image, args.tile_trigger, args.tile_size, args.overlap)
-
-    tile_directory: Path | None
-    if args.save_tiles:
-        tile_directory = source.parent / f"{source.stem}_tiles"
-        tile_directory.mkdir(exist_ok=True)
-    else:
-        tile_directory = None
-=======
     output = Path(args.output).resolve() if args.output else source.with_name(source.stem + "_preannotation.json")
     log_file = Path(args.log_file).resolve() if args.log_file else source.with_name(source.stem + "_preannotation.log")
     configure_logging(log_file, args.verbose)
@@ -519,7 +340,6 @@ def process_scan(args: argparse.Namespace) -> Path:
     if args.save_tiles:
         tile_directory = source.parent / f"{source.stem}_tiles"
         tile_directory.mkdir(exist_ok=True)
->>>>>>> 095a933 (bug fixes)
 
     collected: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -528,25 +348,6 @@ def process_scan(args: argparse.Namespace) -> Path:
 
     for tile in tiles:
         prepared = scale_for_model(tile.image, args.max_side, args.upscale)
-<<<<<<< HEAD
-        LOG.info(
-            "[%d/%d] Bereich %s, Modellbild %d x %d",
-            tile.index, len(tiles), tile.box, prepared.width, prepared.height,
-        )
-        if tile_directory:
-            tile_path = tile_directory / f"tile_{tile.index:03d}.jpg"
-            prepared.save(tile_path, quality=92)
-            LOG.info("Modellbild gespeichert: %s", tile_path)
-
-        try:
-            result = call_qwen(
-                prepared, args.model, args.ctx, args.timeout, tile.index
-            )
-            raw_lines = result.get("lines", [])
-            if not isinstance(raw_lines, list):
-                raise ValueError('Antwort enthält keine Liste "lines".')
-
-=======
         LOG.info("[%d/%d] Bereich %s, Modellbild %d x %d", tile.index, len(tiles), tile.box, prepared.width, prepared.height)
         if tile_directory:
             tile_path = tile_directory / f"tile_{tile.index:03d}.jpg"
@@ -556,40 +357,22 @@ def process_scan(args: argparse.Namespace) -> Path:
             raw_lines = result.get("lines", [])
             if not isinstance(raw_lines, list):
                 raise ValueError('Antwort enthält keine Liste "lines".')
->>>>>>> 095a933 (bug fixes)
             accepted = 0
             for raw_line in raw_lines:
                 if not isinstance(raw_line, dict):
                     continue
                 try:
-<<<<<<< HEAD
-                    local_bbox = validate_local_bbox(
-                        raw_line.get("bbox_1000", raw_line.get("bbox"))
-                    )
-                except (TypeError, ValueError) as error:
-                    LOG.warning("Zeile wegen ungültiger Box übersprungen: %s", error)
-                    continue
-
-                bbox_pixels, bbox_1000 = local_to_global_bbox(
-                    local_bbox, tile.box, page_width, page_height
-                )
-=======
                     local_bbox = validate_local_bbox(raw_line.get("bbox_1000", raw_line.get("bbox")))
                 except (TypeError, ValueError) as error:
                     LOG.warning("Zeile wegen ungültiger Box übersprungen: %s", error)
                     continue
                 bbox_pixels, bbox_1000 = local_to_global_bbox(local_bbox, tile.box, page_width, page_height)
->>>>>>> 095a933 (bug fixes)
                 confidence = str(raw_line.get("confidence", "low")).lower().strip()
                 if confidence not in {"high", "medium", "low"}:
                     confidence = "low"
                 text = str(raw_line.get("text", "")).strip()
                 if not text:
                     continue
-<<<<<<< HEAD
-
-=======
->>>>>>> 095a933 (bug fixes)
                 collected.append({
                     "id": "",
                     "bbox_pixels": bbox_pixels,
@@ -600,10 +383,6 @@ def process_scan(args: argparse.Namespace) -> Path:
                 })
                 accepted += 1
             LOG.info("Abschnitt %d: %d gültige Zeilen übernommen", tile.index, accepted)
-<<<<<<< HEAD
-
-=======
->>>>>>> 095a933 (bug fixes)
         except Exception as error:
             errors.append({"tile": tile.index, "box": list(tile.box), "error": str(error)})
             LOG.exception("Fehler in Abschnitt %d: %s", tile.index, error)
@@ -612,12 +391,6 @@ def process_scan(args: argparse.Namespace) -> Path:
 
     final_lines = merge_lines(collected)
     document = {
-<<<<<<< HEAD
-        "schema_version": "1.2",
-        "task": "handwritten_line_preannotation",
-        "coordinate_system": "normalized_0_1000_and_pixels",
-        "image": {"file": str(source), "width": page_width, "height": page_height},
-=======
         "schema_version": "1.3",
         "task": "handwritten_line_preannotation",
         "coordinate_system": "original_pixels",
@@ -627,7 +400,6 @@ def process_scan(args: argparse.Namespace) -> Path:
             "width": page_width,
             "height": page_height,
         },
->>>>>>> 095a933 (bug fixes)
         "processing": {
             "model": args.model,
             "context_size": args.ctx,
@@ -653,13 +425,7 @@ def process_scan(args: argparse.Namespace) -> Path:
 def percentage(value: str) -> float:
     number = float(value)
     if not 0 <= number < 0.5:
-<<<<<<< HEAD
-        raise argparse.ArgumentTypeError(
-            "Überlappung muss zwischen 0 und kleiner 0,5 liegen."
-        )
-=======
         raise argparse.ArgumentTypeError("Überlappung muss zwischen 0 und kleiner 0,5 liegen.")
->>>>>>> 095a933 (bug fixes)
     return number
 
 
@@ -671,22 +437,10 @@ def positive_int(value: str) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-<<<<<<< HEAD
-    parser = argparse.ArgumentParser(
-        description=(
-            "Qwen-VL-Vorannotation mit Skalierung, Kachelung, Streaming-Logging "
-            "und globalen Zeilenboxen."
-        )
-    )
+    parser = argparse.ArgumentParser(description="Qwen-VL-Vorannotation mit Ollama in Docker.")
     parser.add_argument("image", help="PNG-, JPEG- oder anderes von Pillow unterstütztes Bild")
     parser.add_argument("--output", help="Ausgabe-JSON; Standard: <bild>_preannotation.json")
     parser.add_argument("--log-file", help="Logdatei; Standard: <bild>_preannotation.log")
-=======
-    parser = argparse.ArgumentParser(description="Qwen-VL-Vorannotation mit Ollama in Docker.")
-    parser.add_argument("image", help="PNG-, JPEG- oder anderes von Pillow unterstütztes Bild")
-    parser.add_argument("--output", help="Ausgabe-JSON; Standard: _preannotation.json")
-    parser.add_argument("--log-file", help="Logdatei; Standard: _preannotation.log")
->>>>>>> 095a933 (bug fixes)
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama-Modell; Standard: {DEFAULT_MODEL}")
     parser.add_argument("--ctx", type=positive_int, default=DEFAULT_CONTEXT, help=f"Ollama-Kontextgröße; Standard: {DEFAULT_CONTEXT}")
     parser.add_argument("--max-side", type=positive_int, default=DEFAULT_MAX_SIDE, help=f"Maximale Seitenlänge je Modellbild; Standard: {DEFAULT_MAX_SIDE}")

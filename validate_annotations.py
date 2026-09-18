@@ -240,16 +240,20 @@ def main() -> int:
         print(f"FEHLER: {exc}", file=sys.stderr)
         return 2
 
+    overlap_as_errors = args.strict_overlap and warnings
+    error_count = len(errors) + len(warnings) if overlap_as_errors else len(errors)
+    warning_count = 0 if overlap_as_errors else len(warnings)
+
     print(f"Bild: {image_path}")
     print(f"Bildgröße: {size[0]} x {size[1]} Pixel")
-    print(f"Fehler: {len(errors)} | Warnungen: {len(warnings)}")
+    print(f"Fehler: {error_count} | Warnungen: {warning_count}")
     for item in errors:
         print(f"ERROR  {item}")
     for item in warnings:
         prefix = "ERROR  " if args.strict_overlap else "WARN   "
         print(f"{prefix}{item}")
 
-    return 1 if errors or (args.strict_overlap and warnings) else 0
+    return 1 if errors or overlap_as_errors else 0
 
 
 if __name__ == "__main__":
