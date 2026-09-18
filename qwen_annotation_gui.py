@@ -16,17 +16,27 @@ OLLAMA_API = "http://127.0.0.1:11434/api/chat"
 DEFAULT_MODEL = "qwen3-vl:4b"
 DEFAULT_CONTEXT_SIZE = 4096
 CONFIDENCE_VALUES = {"high", "medium", "low"}
+<<<<<<< HEAD
 TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1", "y1", "x2", "y2"]
+=======
+TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1_px", "y1_px", "x2_px", "y2_px"]
+>>>>>>> 095a933 (bug fixes)
 
 PREANNOTATION_PROMPT = """
 Analysiere diese gescannte Seite mit deutscher Handschrift.
 Erkenne alle handschriftlichen Textzeilen in natürlicher Leserichtung.
 Gib ausschließlich gültiges JSON in diesem Format zurück:
+<<<<<<< HEAD
 {
   "lines": [
     {"bbox_1000": [x1, y1, x2, y2], "text": "erkannter Text", "confidence": "high"}
   ]
 }
+=======
+
+{"lines": [{"bbox_1000": [x1, y1, x2, y2], "text": "erkannter Text", "confidence": "high"}]}
+
+>>>>>>> 095a933 (bug fixes)
 Die Koordinaten müssen auf 0 bis 1000 normalisiert sein. Jede Textzeile erhält
 eine eigene, möglichst eng anliegende Box. Ergänze keine unsichtbaren Wörter.
 Zahlen, Namen und Einheiten nicht plausibilisieren. Unleserliches als
@@ -60,7 +70,11 @@ def extract_json(raw: str) -> dict[str, Any]:
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         raise ValueError("Qwen hat kein JSON-Objekt zurückgegeben.")
+<<<<<<< HEAD
     value = json.loads(text[start:end + 1])
+=======
+    value = json.loads(text[start : end + 1])
+>>>>>>> 095a933 (bug fixes)
     if not isinstance(value, dict):
         raise ValueError("Die JSON-Wurzel ist kein Objekt.")
     return value
@@ -82,6 +96,41 @@ def validate_bbox(value: Any) -> list[int]:
     return [x1, y1, x2, y2]
 
 
+<<<<<<< HEAD
+=======
+def validate_pixel_bbox(value: Any, width: int, height: int) -> list[int]:
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        raise ValueError(f"Ungültige Pixel-Box: {value!r}")
+    x1 = clamp(round(float(value[0])), 0, width)
+    y1 = clamp(round(float(value[1])), 0, height)
+    x2 = clamp(round(float(value[2])), 0, width)
+    y2 = clamp(round(float(value[3])), 0, height)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"Leere Pixel-Box: {value!r}")
+    return [x1, y1, x2, y2]
+
+
+def bbox_1000_to_pixels(bbox: list[int], width: int, height: int) -> list[int]:
+    x1, y1, x2, y2 = validate_bbox(bbox)
+    return [
+        clamp(round(x1 * width / 1000), 0, width),
+        clamp(round(y1 * height / 1000), 0, height),
+        clamp(round(x2 * width / 1000), 0, width),
+        clamp(round(y2 * height / 1000), 0, height),
+    ]
+
+
+def pixels_to_bbox_1000(pixel_box: list[int], width: int, height: int) -> list[int]:
+    x1, y1, x2, y2 = validate_pixel_bbox(pixel_box, width, height)
+    return [
+        clamp(round(x1 * 1000 / width), 0, 1000),
+        clamp(round(y1 * 1000 / height), 0, 1000),
+        clamp(round(x2 * 1000 / width), 0, 1000),
+        clamp(round(y2 * 1000 / height), 0, 1000),
+    ]
+
+
+>>>>>>> 095a933 (bug fixes)
 def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
     raw_lines = data.get("lines")
     if not isinstance(raw_lines, list):
@@ -94,7 +143,11 @@ def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
             bbox = validate_bbox(item.get("bbox_1000", item.get("bbox")))
         except (TypeError, ValueError):
             continue
+<<<<<<< HEAD
         text = str(item.get("text_corrected",item.get("text_predicted",item.get("text","")))).strip()
+=======
+        text = str(item.get("text_corrected", item.get("text_predicted", item.get("text", "")))).strip()
+>>>>>>> 095a933 (bug fixes)
         confidence = str(item.get("confidence", "low")).lower().strip()
         if confidence not in CONFIDENCE_VALUES:
             confidence = "low"
@@ -109,7 +162,59 @@ def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
     result.sort(key=lambda x: (x["bbox_1000"][1], x["bbox_1000"][0]))
     for number, item in enumerate(result, 1):
         item["id"] = f"line_{number:04d}"
+<<<<<<< HEAD
     return {"schema_version": "1.0", "coordinate_system": "normalized_0_1000", "lines": result}
+=======
+    return {
+        "schema_version": "1.3",
+        "coordinate_system": "original_pixels",
+        "lines": result,
+    }
+
+
+def ensure_pixel_boxes(annotation: dict[str, Any], image_path: str) -> dict[str, Any]:
+    """Macht bbox_pixels zur führenden, verlustfreien Koordinatenquelle."""
+    result = copy.deepcopy(annotation)
+    image = open_scan(image_path)
+    width, height = image.size
+
+    stored_image = result.get("image")
+    if not isinstance(stored_image, dict):
+        stored_image = {}
+
+    result["image"] = {
+        **stored_image,
+        "file": str(Path(image_path).resolve()),
+        "file_name": Path(image_path).name,
+        "width": width,
+        "height": height,
+    }
+
+    for index, line in enumerate(result.get("lines", []), 1):
+        if not isinstance(line, dict):
+            continue
+        line.setdefault("id", f"line_{index:04d}")
+        if "text" in line:
+            line.setdefault("text_predicted", line["text"])
+            line.setdefault("text_corrected", line["text"])
+        line.setdefault("text_predicted", line.get("text_corrected", ""))
+        line.setdefault("text_corrected", line.get("text_predicted", ""))
+        confidence = str(line.get("confidence", "low")).lower().strip()
+        line["confidence"] = confidence if confidence in CONFIDENCE_VALUES else "low"
+        line.setdefault("status", "unreviewed")
+
+        try:
+            pixel_box = validate_pixel_bbox(line.get("bbox_pixels"), width, height)
+        except (TypeError, ValueError):
+            pixel_box = bbox_1000_to_pixels(line["bbox_1000"], width, height)
+
+        line["bbox_pixels"] = pixel_box
+        line["bbox_1000"] = pixels_to_bbox_1000(pixel_box, width, height)
+
+    result["schema_version"] = "1.3"
+    result["coordinate_system"] = "original_pixels"
+    return result
+>>>>>>> 095a933 (bug fixes)
 
 
 def run_qwen(image_path: str, model: str, context_size: int) -> dict[str, Any]:
@@ -118,7 +223,15 @@ def run_qwen(image_path: str, model: str, context_size: int) -> dict[str, Any]:
         raise FileNotFoundError(path)
     payload = {
         "model": model.strip(),
+<<<<<<< HEAD
         "messages": [{"role": "user", "content": PREANNOTATION_PROMPT, "images": [encode_image(path)]}],
+=======
+        "messages": [{
+            "role": "user",
+            "content": PREANNOTATION_PROMPT,
+            "images": [encode_image(path)],
+        }],
+>>>>>>> 095a933 (bug fixes)
         "stream": False,
         "format": "json",
         "options": {"temperature": 0, "num_ctx": int(context_size)},
@@ -133,29 +246,38 @@ def run_qwen(image_path: str, model: str, context_size: int) -> dict[str, Any]:
 
 
 def add_metadata(annotation: dict[str, Any], image_path: str, model: str) -> dict[str, Any]:
+<<<<<<< HEAD
     result = copy.deepcopy(annotation)
     image = open_scan(image_path)
     width, height = image.size
     result.update({
         "image": {"file": str(Path(image_path).resolve()), "file_name": Path(image_path).name,
                   "width": width, "height": height},
+=======
+    result = ensure_pixel_boxes(annotation, image_path)
+    result.update({
+>>>>>>> 095a933 (bug fixes)
         "model": model.strip(),
         "task": "handwritten_line_transcription",
     })
     return result
 
 
+<<<<<<< HEAD
 def to_pixels(box: list[int], width: int, height: int) -> tuple[int, int, int, int]:
     x1, y1, x2, y2 = box
     return round(x1*width/1000), round(y1*height/1000), round(x2*width/1000), round(y2*height/1000)
 
 
+=======
+>>>>>>> 095a933 (bug fixes)
 def line_to_pixels(
     line: dict[str, Any],
     annotation: dict[str, Any],
     actual_width: int,
     actual_height: int,
 ) -> tuple[int, int, int, int]:
+<<<<<<< HEAD
     """Verwendet bevorzugt globale Originalpixel, sonst bbox_1000."""
     pixel_box = line.get("bbox_pixels")
     if isinstance(pixel_box, (list, tuple)) and len(pixel_box) == 4:
@@ -185,6 +307,13 @@ def line_to_pixels(
     return to_pixels(
         validate_bbox(line["bbox_1000"]), actual_width, actual_height
     )
+=======
+    """Liest Originalpixel direkt; keine Reskalierung von gespeicherten Boxen."""
+    try:
+        return tuple(validate_pixel_bbox(line.get("bbox_pixels"), actual_width, actual_height))
+    except (TypeError, ValueError):
+        return tuple(bbox_1000_to_pixels(line["bbox_1000"], actual_width, actual_height))
+>>>>>>> 095a933 (bug fixes)
 
 
 def get_font(size: int) -> ImageFont.ImageFont:
@@ -203,7 +332,11 @@ def draw_annotations(image_path: str, annotation: dict[str, Any], selected: int 
     for index, line in enumerate(annotation.get("lines", [])):
         box = line_to_pixels(line, annotation, image.width, image.height)
         color = "#0067C0" if index == selected else colors.get(line.get("confidence"), "#DA1E28")
+<<<<<<< HEAD
         draw.rectangle(box, outline=color, width=width*3 if index == selected else width)
+=======
+        draw.rectangle(box, outline=color, width=width * 3 if index == selected else width)
+>>>>>>> 095a933 (bug fixes)
         label = str(index + 1)
         anchor = (box[0], max(0, box[1] - 30))
         text_box = draw.textbbox(anchor, label, font=font)
@@ -218,6 +351,7 @@ def crop_line(image_path: str, annotation: dict[str, Any], selected: int) -> Ima
         return None
     image = open_scan(image_path)
     x1, y1, x2, y2 = line_to_pixels(lines[selected], annotation, image.width, image.height)
+<<<<<<< HEAD
     mx, my = max(10, image.width//70), max(8, image.height//150)
     return image.crop((max(0,x1-mx), max(0,y1-my), min(image.width,x2+mx), min(image.height,y2+my)))
 
@@ -225,6 +359,17 @@ def crop_line(image_path: str, annotation: dict[str, Any], selected: int) -> Ima
 def annotation_to_table(annotation: dict[str, Any]) -> list[list[Any]]:
     return [[x["id"], x["text_corrected"], x["confidence"], *x["bbox_1000"]]
             for x in annotation.get("lines", [])]
+=======
+    mx, my = max(10, image.width // 70), max(8, image.height // 150)
+    return image.crop((max(0, x1 - mx), max(0, y1 - my), min(image.width, x2 + mx), min(image.height, y2 + my)))
+
+
+def annotation_to_table(annotation: dict[str, Any]) -> list[list[Any]]:
+    return [
+        [line["id"], line["text_corrected"], line["confidence"], *line["bbox_pixels"]]
+        for line in annotation.get("lines", [])
+    ]
+>>>>>>> 095a933 (bug fixes)
 
 
 def table_to_annotation(table: Any, annotation: dict[str, Any]) -> dict[str, Any]:
@@ -233,32 +378,65 @@ def table_to_annotation(table: Any, annotation: dict[str, Any]) -> dict[str, Any
         return result
     if hasattr(table, "values"):
         table = table.values.tolist()
+<<<<<<< HEAD
     old = result.get("lines", [])
+=======
+
+    image = result.get("image", {})
+    width = int(image.get("width", 0))
+    height = int(image.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise ValueError("Die Bildgröße fehlt. Annotation zuerst mit einem Bild laden.")
+
+    old_lines = result.get("lines", [])
+>>>>>>> 095a933 (bug fixes)
     lines = []
     for index, row in enumerate(table):
         if row is None or len(row) < 7:
             continue
+<<<<<<< HEAD
         previous = old[index] if index < len(old) else {}
+=======
+        previous = old_lines[index] if index < len(old_lines) else {}
+>>>>>>> 095a933 (bug fixes)
         corrected = str(row[1] if row[1] is not None else "").strip()
         predicted = previous.get("text_predicted", corrected)
         confidence = str(row[2] or "low").lower().strip()
         if confidence not in CONFIDENCE_VALUES:
             confidence = "low"
+<<<<<<< HEAD
         updated = copy.deepcopy(previous)
         updated.update({
             "id": str(row[0] or f"line_{index+1:04d}"),
             "bbox_1000": validate_bbox(list(row[3:7])),
+=======
+
+        pixel_box = validate_pixel_bbox(list(row[3:7]), width, height)
+        updated = copy.deepcopy(previous)
+        updated.update({
+            "id": str(row[0] or f"line_{index + 1:04d}"),
+            "bbox_pixels": pixel_box,
+            "bbox_1000": pixels_to_bbox_1000(pixel_box, width, height),
+>>>>>>> 095a933 (bug fixes)
             "text_predicted": predicted,
             "text_corrected": corrected,
             "confidence": confidence,
             "status": "corrected" if corrected != predicted else "confirmed",
         })
+<<<<<<< HEAD
         # Nach manueller Änderung der normalisierten Box sind alte Pixelwerte
         # nicht mehr verlässlich und werden daher entfernt.
         if previous.get("bbox_1000") != updated["bbox_1000"]:
             updated.pop("bbox_pixels", None)
         lines.append(updated)
     result["lines"] = lines
+=======
+        lines.append(updated)
+
+    result["lines"] = lines
+    result["coordinate_system"] = "original_pixels"
+    result["schema_version"] = "1.3"
+>>>>>>> 095a933 (bug fixes)
     return result
 
 
@@ -268,11 +446,23 @@ def start_preannotation(image_path: str | None, model: str, context: int):
     try:
         annotation = add_metadata(run_qwen(image_path, model, context), image_path, model)
         selected = 0 if annotation["lines"] else -1
+<<<<<<< HEAD
         return (annotation, image_path, selected,
                 draw_annotations(image_path, annotation, selected),
                 crop_line(image_path, annotation, selected),
                 annotation_to_table(annotation),
                 f"{len(annotation['lines'])} Zeilen erkannt.")
+=======
+        return (
+            annotation,
+            image_path,
+            selected,
+            draw_annotations(image_path, annotation, selected),
+            crop_line(image_path, annotation, selected),
+            annotation_to_table(annotation),
+            f"{len(annotation['lines'])} Zeilen erkannt.",
+        )
+>>>>>>> 095a933 (bug fixes)
     except requests.ConnectionError as exc:
         raise gr.Error("Ollama ist unter 127.0.0.1:11434 nicht erreichbar.") from exc
     except Exception as exc:
@@ -286,6 +476,7 @@ def load_annotation(image_path: str | None, json_path: str | None):
         data = json.loads(Path(json_path).read_text(encoding="utf-8"))
         if not data.get("schema_version"):
             data = normalize_annotation(data)
+<<<<<<< HEAD
         else:
             for index, line in enumerate(data.get("lines", []), 1):
                 if "text" in line:
@@ -306,12 +497,28 @@ def load_annotation(image_path: str | None, json_path: str | None):
                 line.setdefault("status", "unreviewed")
         selected = 0 if data.get("lines") else -1
         return data, image_path, selected, draw_annotations(image_path, data, selected), crop_line(image_path, data, selected), annotation_to_table(data), f"{len(data.get('lines', []))} Zeilen geladen."
+=======
+        data = ensure_pixel_boxes(data, image_path)
+        selected = 0 if data.get("lines") else -1
+        return (
+            data,
+            image_path,
+            selected,
+            draw_annotations(image_path, data, selected),
+            crop_line(image_path, data, selected),
+            annotation_to_table(data),
+            f"{len(data.get('lines', []))} Zeilen geladen.",
+        )
+>>>>>>> 095a933 (bug fixes)
     except Exception as exc:
         raise gr.Error(f"Laden fehlgeschlagen: {exc}") from exc
 
 
 def select_row(table: Any, annotation: dict[str, Any], image_path: str, evt: gr.SelectData):
+<<<<<<< HEAD
     """Verarbeitet Dataframe-Auswahlereignisse aus Gradio 6.x robust."""
+=======
+>>>>>>> 095a933 (bug fixes)
     annotation = table_to_annotation(table, annotation)
     event_index = evt.index
     if isinstance(event_index, (list, tuple)):
@@ -328,7 +535,11 @@ def select_row(table: Any, annotation: dict[str, Any], image_path: str, evt: gr.
         draw_annotations(image_path, annotation, index),
         crop_line(image_path, annotation, index),
         index,
+<<<<<<< HEAD
         f"Ausgewählt: Zeile {index+1}",
+=======
+        f"Ausgewählt: Zeile {index + 1}",
+>>>>>>> 095a933 (bug fixes)
     )
 
 
@@ -337,7 +548,11 @@ def refresh(table: Any, annotation: dict[str, Any], image_path: str, selected: i
         raise gr.Error("Keine Annotation geladen.")
     annotation = table_to_annotation(table, annotation)
     if annotation.get("lines"):
+<<<<<<< HEAD
         selected = clamp(int(selected), 0, len(annotation["lines"])-1)
+=======
+        selected = clamp(int(selected), 0, len(annotation["lines"]) - 1)
+>>>>>>> 095a933 (bug fixes)
     else:
         selected = -1
     return annotation, draw_annotations(image_path, annotation, selected), crop_line(image_path, annotation, selected), selected, "Änderungen übernommen."
@@ -376,6 +591,7 @@ def training_record(annotation: dict[str, Any], image_path: str, dataset_root: s
     answer = training_answer(annotation)
     if not answer["lines"]:
         raise ValueError("Keine Zeilen mit korrigiertem Text vorhanden.")
+<<<<<<< HEAD
     return {"messages": [
         {"role": "user", "content": [
             {"type": "image", "image": relative_image_path(image_path, dataset_root)},
@@ -385,6 +601,19 @@ def training_record(annotation: dict[str, Any], image_path: str, dataset_root: s
             {"type": "text", "text": json.dumps(answer, ensure_ascii=False, separators=(",", ":"))}
         ]},
     ]}
+=======
+    return {
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "image", "image": relative_image_path(image_path, dataset_root)},
+                {"type": "text", "text": TRAINING_PROMPT},
+            ]},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": json.dumps(answer, ensure_ascii=False, separators=(",", ":"))}
+            ]},
+        ]
+    }
+>>>>>>> 095a933 (bug fixes)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -421,10 +650,20 @@ def export_jsonl(table: Any, annotation: dict[str, Any], image_path: str, datase
         output = root / "train.jsonl"
         records = [] if mode == "Datei ersetzen" else read_jsonl(output)
         image_key = record_image(record)
+<<<<<<< HEAD
         # Deduplizieren: vorhandenen Datensatz derselben Bilddatei ersetzen.
         records = [item for item in records if record_image(item) != image_key]
         records.append(record)
         output.write_text("".join(json.dumps(x, ensure_ascii=False, separators=(",", ":")) + "\n" for x in records), encoding="utf-8", newline="\n")
+=======
+        records = [item for item in records if record_image(item) != image_key]
+        records.append(record)
+        output.write_text(
+            "".join(json.dumps(x, ensure_ascii=False, separators=(",", ":")) + "\n" for x in records),
+            encoding="utf-8",
+            newline="\n",
+        )
+>>>>>>> 095a933 (bug fixes)
         return annotation, str(output), f"JSONL exportiert: {output} | {len(records)} Datensätze, aktuelle Seite {len(training_answer(annotation)['lines'])} Zeilen."
     except Exception as exc:
         raise gr.Error(f"JSONL-Export fehlgeschlagen: {exc}") from exc
@@ -435,7 +674,11 @@ def build_interface() -> gr.Blocks:
         annotation_state = gr.State({})
         image_state = gr.State("")
         selected_state = gr.State(-1)
+<<<<<<< HEAD
         gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern.")
+=======
+        gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.")
+>>>>>>> 095a933 (bug fixes)
         with gr.Row():
             with gr.Column(scale=1):
                 image = gr.Image(label="Originalscan", type="filepath", sources=["upload"])
@@ -445,6 +688,7 @@ def build_interface() -> gr.Blocks:
                 existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
                 load = gr.Button("Scan und JSON laden")
             with gr.Column(scale=2):
+<<<<<<< HEAD
                 preview = gr.Image(
                     label="Zeilenboxen",
                     type="pil",
@@ -457,13 +701,22 @@ def build_interface() -> gr.Blocks:
                     height=180,
                 )
         table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str","str","str","number","number","number","number"], column_count=(7,"fixed"), label="Text und Boxen korrigieren", interactive=True, wrap=True)
+=======
+                preview = gr.Image(label="Zeilenboxen", type="pil", interactive=False)
+                crop = gr.Image(label="Ausgewählte Zeile", type="pil", interactive=False, height=180)
+                table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number"], column_count=(7, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
+>>>>>>> 095a933 (bug fixes)
         with gr.Row():
             refresh_button = gr.Button("Änderungen übernehmen")
             save_button = gr.Button("Annotations-JSON speichern")
         with gr.Row():
             dataset_root = gr.Textbox(label="Dataset-Wurzelverzeichnis", placeholder=r"C:\Handschrift-Dataset")
             export_mode = gr.Radio(["An Datei anhängen / Seite aktualisieren", "Datei ersetzen"], value="An Datei anhängen / Seite aktualisieren", label="Exportmodus")
+<<<<<<< HEAD
         export_button = gr.Button("Als Qwen-Trainings-JSONL exportieren", variant="primary")
+=======
+            export_button = gr.Button("Als Qwen-Trainings-JSONL exportieren", variant="primary")
+>>>>>>> 095a933 (bug fixes)
         with gr.Row():
             annotation_file = gr.File(label="Annotations-JSON")
             training_file = gr.File(label="Qwen-Trainings-JSONL")
