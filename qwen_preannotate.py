@@ -22,6 +22,7 @@ OLLAMA_API = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434/api/chat")
 DEFAULT_MODEL = "qwen3-vl:4b"
 DEFAULT_CONTEXT = 8192
 DEFAULT_MAX_SIDE = 1024
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
 
 PROMPT = """
 Analysiere diesen Bildausschnitt einer gescannten Seite mit deutscher Handschrift.
@@ -35,12 +36,18 @@ möglichst eng umschließen. Sortiere von oben nach unten, dann von links nach
 rechts. Ergänze keine nicht sichtbaren Wörter. Zahlen, Namen und Einheiten nicht
 plausibilisieren. Unleserliches als [unleserlich], Unsicheres mit [?] markieren.
 Ignoriere automatisch vom Scanner oder der Scan-Software hinzugefügte Elemente
-wie Wasserzeichen, Stempel, Zeitstempel, Seiten- oder Dateinummern und
+wie Wasserzeichen, Stempel oder Dateinummern und
 Softwarehinweise am Rand; sie gehören nicht zum handschriftlichen Original und
 werden nicht als Textzeile erfasst. Gib dazu keine Erklärungen, Ablehnungen
 oder Hinweise zu Urheberrecht, Lizenzen oder Impressum aus. Diese Anfrage ist
 für ein privates Handschrift-Digitalisierungsprojekt und enthält keine echten
 Rechtsdokumente.
+Analysiere das Bild in genau einem Durchgang. Sobald du eine Zeile einmal
+gelesen und ihren Text festgelegt hast, lies diese Zeile nicht erneut und
+stelle deine Lesung nicht wiederholt infrage (kein "Wait", kein erneutes
+Prüfen, kein Nochmal-Ansehen). Nenne jede Zeile genau einmal und gehe danach
+sofort zur nächsten über, auch wenn du unsicher bist – markiere Unsicherheit
+stattdessen mit [?] oder confidence "low".
 confidence darf nur high, medium oder low sein. Keine Markdown-Codeblöcke und
 keine Erläuterungen ausgeben.
 """.strip()
@@ -87,11 +94,15 @@ class RepetitionLoopError(RuntimeError):
 class OllamaLineLogger:
     """Sammelt Streaming-Fragmente, protokolliert fertige Textzeilen und bricht bei Wiederholungsschleifen ab."""
 
+    STREAK_LIMIT = 30
+
     def __init__(self, tag: str = "OLLAMA") -> None:
         self.tag = tag
         self.buffer = ""
         self.line_number = 0
         self.recent_lines: list[str] = []
+        self.seen_lines: set[str] = set()
+        self.repeat_streak = 0
 
     def feed(self, fragment: str) -> None:
         self.buffer += fragment.replace("\r\n", "\n").replace("\r", "\n")
@@ -113,12 +124,29 @@ class OllamaLineLogger:
         stripped = line.strip()
         if not stripped:
             return
+
+        # Kurze, eng getaktete Wiederholungszyklen (z.B. zwei alternierende Zeilen).
         self.recent_lines.append(stripped)
         del self.recent_lines[:-64]
         if is_repeating(self.recent_lines):
             raise RepetitionLoopError(
                 f"Modell wiederholt sich endlos ({self.tag}); Abschnitt abgebrochen."
             )
+
+        # Lange, unregelmäßige Wiederholungsschleifen (z.B. das Modell zweifelt seine
+        # eigene Analyse wiederholt an und leitet dieselben Zeilen mehrfach neu her).
+        # Hier reicht keine feste Zyklenlänge, da der Abstand zwischen Wiederholungen
+        # sehr groß und die Formulierung leicht variabel sein kann.
+        if stripped in self.seen_lines:
+            self.repeat_streak += 1
+            if self.repeat_streak >= self.STREAK_LIMIT:
+                raise RepetitionLoopError(
+                    f"Modell wiederholt bereits gesehene Zeilen ({self.tag}); "
+                    f"{self.repeat_streak} Wiederholungen in Folge; Abschnitt abgebrochen."
+                )
+        else:
+            self.seen_lines.add(stripped)
+            self.repeat_streak = 0
 
 
 def extract_json(raw: str) -> dict[str, Any]:
@@ -366,6 +394,67 @@ def resolve_page_paths(args: argparse.Namespace, source: Path) -> tuple[Path, Pa
     return output, log_file
 
 
+def is_supported_input(path: Path) -> bool:
+    return path.suffix.lower() in IMAGE_EXTENSIONS or pdf_utils.is_pdf(path)
+
+
+def has_existing_preannotation(source: Path) -> bool:
+    """Prüft, ob für diese Datei bereits eine Vorannotation existiert (einzeln,
+    in Kacheln oder als PDF-Seiten), damit ein Ordnerlauf sie überspringen kann."""
+    if source.with_name(source.stem + "_preannotation.json").exists():
+        return True
+    tiles_dir = source.with_name(f"{source.stem}_tiles")
+    if tiles_dir.is_dir() and any(tiles_dir.glob("*_preannotation.json")):
+        return True
+    pages_dir = source.with_name(f"{source.stem}_pages")
+    if pages_dir.is_dir() and any(pages_dir.glob("**/*_preannotation.json")):
+        return True
+    return False
+
+
+def iter_folder_inputs(folder: Path) -> list[Path]:
+    return sorted(
+        (item for item in folder.iterdir() if item.is_file() and is_supported_input(item)),
+        key=lambda item: item.name.lower(),
+    )
+
+
+def process_input(args: argparse.Namespace) -> list[Path]:
+    source = Path(args.image).resolve()
+    if source.is_dir():
+        return process_folder(args, source)
+    return process_scan(args)
+
+
+def process_folder(args: argparse.Namespace, folder: Path) -> list[Path]:
+    if args.output or args.log_file:
+        raise SystemExit(
+            "--output und --log-file sind bei einem Ordner als Eingabe nicht zulässig; "
+            "Dateinamen werden automatisch je Datei vergeben."
+        )
+    items = iter_folder_inputs(folder)
+    if not items:
+        raise ValueError(f"Keine Bild- oder PDF-Dateien in {folder} gefunden.")
+
+    outputs: list[Path] = []
+    skipped = 0
+    for index, item in enumerate(items, 1):
+        if has_existing_preannotation(item):
+            print(f"[{index}/{len(items)}] Übersprungen (bereits vorannotiert): {item.name}")
+            skipped += 1
+            continue
+        print(f"[{index}/{len(items)}] Verarbeite: {item.name}")
+        item_args = argparse.Namespace(**vars(args))
+        item_args.image = str(item)
+        try:
+            outputs.extend(process_scan(item_args))
+        except Exception as error:
+            print(f"FEHLER bei {item.name}: {error}", file=sys.stderr)
+
+    print(f"Ordner fertig: {len(outputs)} Datei(en) erzeugt, {skipped} bereits vorhandene Datei(en) übersprungen.")
+    return outputs
+
+
 def process_scan(args: argparse.Namespace) -> list[Path]:
     source = Path(args.image).resolve()
     if not source.is_file():
@@ -529,11 +618,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Qwen-VL-Vorannotation mit Ollama in Docker.")
     parser.add_argument(
         "image",
-        help="PNG-, JPEG-, PDF- oder anderes von Pillow unterstütztes Bild "
-        "(bei PDF wird jede Seite einzeln verarbeitet)",
+        help="PNG-, JPEG-, PDF- oder anderes von Pillow unterstütztes Bild, oder ein "
+        "Ordner mit solchen Dateien (bei PDF wird jede Seite einzeln verarbeitet; bei "
+        "einem Ordner wird jede darin enthaltene Bild- oder PDF-Datei einzeln verarbeitet "
+        "und bereits vorannotierte Dateien werden übersprungen)",
     )
-    parser.add_argument("--output", help="Ausgabe-JSON; Standard: <bild>_preannotation.json (nicht bei mehrseitigem PDF)")
-    parser.add_argument("--log-file", help="Logdatei; Standard: <bild>_preannotation.log (nicht bei mehrseitigem PDF)")
+    parser.add_argument("--output", help="Ausgabe-JSON; Standard: <bild>_preannotation.json (nicht bei mehrseitigem PDF oder Ordner)")
+    parser.add_argument("--log-file", help="Logdatei; Standard: <bild>_preannotation.log (nicht bei mehrseitigem PDF oder Ordner)")
     parser.add_argument(
         "--pdf-dpi",
         type=positive_int,
@@ -564,7 +655,7 @@ def main() -> None:
     if args.max_side < 512 or args.tile_size < 512 or args.tile_trigger < 512:
         raise SystemExit("max-side, tile-size und tile-trigger müssen mindestens 512 sein.")
     try:
-        process_scan(args)
+        process_input(args)
     except KeyboardInterrupt:
         LOG.error("Verarbeitung durch Benutzer abgebrochen.")
         raise SystemExit(130)

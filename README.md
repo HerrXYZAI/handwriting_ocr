@@ -95,6 +95,19 @@ jeweiligen Kachel-Annotationen bestehen.
   usw. statt einer einzelnen `<scan-name>_preannotation.json`. `--output`/`--log-file`
   sind dann nicht zulässig, da die Namen je Kachel automatisch vergeben werden.
 
+## Ordner-Stapelverarbeitung (nur Kommandozeile)
+
+`python qwen_preannotate.py C:\Ordner` verarbeitet statt einer einzelnen Datei jede
+Bild- oder PDF-Datei direkt in diesem Ordner (nicht rekursiv in Unterordnern). Dateien,
+für die bereits eine Vorannotation existiert (`<name>_preannotation.json`, oder bei
+Kacheln/PDF-Seiten mindestens eine `*_preannotation.json` im zugehörigen
+`<name>_tiles\`- bzw. `<name>_pages\`-Ordner), werden übersprungen. Damit lässt sich ein
+abgebrochener oder erweiterter Ordnerlauf einfach fortsetzen, ohne bereits fertige
+Dateien erneut zu verarbeiten. `--output`/`--log-file` sind bei einem Ordner nicht
+zulässig, da die Namen je Datei automatisch vergeben werden. Ein Fehler bei einer Datei
+bricht den Ordnerlauf nicht ab; die Datei wird mit Fehlermeldung übersprungen und mit
+den restlichen Dateien fortgefahren.
+
 ## Workflow
 
 1. Originalscan laden (Bild oder PDF-Seite, siehe oben).

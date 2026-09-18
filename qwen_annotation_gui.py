@@ -32,12 +32,18 @@ Die Koordinaten müssen auf 0 bis 1000 normalisiert sein. Jede Textzeile erhält
 eine eigene, möglichst eng anliegende Box. Ergänze keine unsichtbaren Wörter.
 Zahlen, Namen und Einheiten nicht plausibilisieren. Unleserliches als
 [unleserlich], unsichere Wörter mit [?]. Ignoriere automatisch vom Scanner
-oder der Scan-Software hinzugefügte Elemente wie Wasserzeichen, Stempel,
-Zeitstempel, Seiten- oder Dateinummern und Softwarehinweise am Rand; sie
+oder der Scan-Software hinzugefügte Elemente wie Wasserzeichen, Stempel
+oder Dateinummern und Softwarehinweise am Rand; sie
 gehören nicht zum handschriftlichen Original und werden nicht als Textzeile
 erfasst. Gib dazu keine Erklärungen, Ablehnungen oder Hinweise zu
 Urheberrecht, Lizenzen oder Impressum aus. Diese Anfrage ist für ein privates
 Handschrift-Digitalisierungsprojekt und enthält keine echten Rechtsdokumente.
+Analysiere das Bild in genau einem Durchgang. Sobald du eine Zeile einmal
+gelesen und ihren Text festgelegt hast, lies diese Zeile nicht erneut und
+stelle deine Lesung nicht wiederholt infrage (kein "Wait", kein erneutes
+Prüfen, kein Nochmal-Ansehen). Nenne jede Zeile genau einmal und gehe danach
+sofort zur nächsten über, auch wenn du unsicher bist – markiere Unsicherheit
+stattdessen mit [?] oder confidence "low".
 confidence ist high, medium oder low. Keine Markdown-Blöcke und keine
 Erläuterungen ausgeben.
 """.strip()
@@ -49,7 +55,7 @@ Eintrag enthält bbox_1000 als [x1,y1,x2,y2] und text. Die Koordinaten sind auf
 0 bis 1000 normalisiert. Sortiere in natürlicher Leserichtung, ergänze keine
 nicht sichtbaren Wörter und markiere Unleserliches mit [unleserlich].
 Ignoriere automatisch vom Scanner oder der Scan-Software hinzugefügte Elemente
-wie Wasserzeichen, Stempel, Zeitstempel, Seiten- oder Dateinummern und
+wie Wasserzeichen, Stempel oder Dateinummern und
 Softwarehinweise am Rand; sie gehören nicht zum handschriftlichen Original und
 werden nicht als Textzeile erfasst.
 """.strip()
@@ -401,6 +407,14 @@ def load_tile(tile_paths: list[str], tile_number: float | int | None) -> tuple[s
     return tile_paths[index], f"Kachel {index + 1} von {len(tile_paths)} geladen."
 
 
+def sync_image_state(image_path: str | None):
+    """Hält image_state synchron, sobald sich der geladene Scan ändert (Upload,
+    PDF-Seite oder Kachel), und verwirft die Annotationsanzeige des vorherigen
+    Bildes, damit sie nicht versehentlich unter dem neuen Bildpfad gespeichert wird.
+    """
+    return image_path or "", {}, -1, None, None, []
+
+
 def load_annotation(image_path: str | None, json_path: str | None):
     if not image_path or not json_path:
         raise gr.Error("Bitte Scan und Annotations-JSON auswählen.")
@@ -595,6 +609,7 @@ def build_interface() -> gr.Blocks:
             training_file = gr.File(label="Qwen-Trainings-JSONL")
         status = gr.Textbox(label="Status", interactive=False)
 
+        image.change(sync_image_state, [image], [image_state, annotation_state, selected_state, preview, crop, table])
         pdf_load.click(load_pdf_page, [pdf_upload, pdf_page], [image, status])
         split_button.click(split_into_tiles, [image], [tile_paths_state, status])
         load_tile_button.click(load_tile, [tile_paths_state, tile_number], [image, status])
