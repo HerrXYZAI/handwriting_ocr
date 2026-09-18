@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import io
 import json
 import re
 from pathlib import Path
@@ -10,7 +11,7 @@ from typing import Any
 
 import gradio as gr
 import requests
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageOps
 
 import pdf_utils
 import tiling
@@ -261,29 +262,215 @@ def line_to_pixels(
         return tuple(bbox_1000_to_pixels(line["bbox_1000"], actual_width, actual_height))
 
 
-def get_font(size: int) -> ImageFont.ImageFont:
-    for name in ("C:/Windows/Fonts/segoeuib.ttf", "C:/Windows/Fonts/arialbd.ttf"):
-        if Path(name).exists():
-            return ImageFont.truetype(name, size=size)
-    return ImageFont.load_default()
+CONFIDENCE_COLORS = {"high": "#24A148", "medium": "#F1C21B", "low": "#DA1E28"}
+SELECTED_COLOR = "#0067C0"
+EMPTY_PREVIEW_HTML = "<div class='bbox-empty'>Kein Bild geladen.</div>"
+
+BBOX_STYLE = """
+<style>
+.bbox-canvas { position: relative; display: inline-block; max-width: 100%; line-height: 0; user-select: none; }
+.bbox-image { display: block; width: 100%; height: auto; max-width: 100%; pointer-events: none; }
+.bbox-box { position: absolute; border-style: solid; border-width: 2px; box-sizing: border-box; cursor: move; }
+.bbox-label { position: absolute; top: -22px; left: -2px; color: white; font-size: 12px; font-weight: bold; padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
+.bbox-handle { position: absolute; width: 10px; height: 10px; background: white; border: 2px solid #0067C0; border-radius: 50%; }
+.bbox-handle-nw { top: -6px; left: -6px; cursor: nwse-resize; }
+.bbox-handle-ne { top: -6px; right: -6px; cursor: nesw-resize; }
+.bbox-handle-sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
+.bbox-handle-se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+.bbox-text { position: absolute; z-index: 20; min-width: 220px; max-width: 420px; }
+.bbox-textarea { width: 100%; min-height: 60px; font-size: 14px; padding: 6px; border: 2px solid #0067C0; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.25); resize: vertical; font-family: inherit; box-sizing: border-box; }
+.bbox-empty { padding: 40px; text-align: center; color: #888; }
+#bbox-sync-box { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; opacity: 0 !important; pointer-events: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; }
+</style>
+"""
+
+BBOX_JS = """
+() => {
+  function qbClamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  function qbSync(payload) {
+    const box = document.querySelector('#bbox-sync-box textarea, #bbox-sync-box input');
+    if (!box) return;
+    box.value = JSON.stringify(payload);
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+    box.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+
+  function qbSyncBox(id) {
+    const box = document.getElementById('box-' + id);
+    const canvas = document.getElementById('bbox-canvas');
+    if (!box || !canvas) return;
+    const width = parseFloat(canvas.dataset.width);
+    const height = parseFloat(canvas.dataset.height);
+    const x1 = Math.round(box.offsetLeft / canvas.clientWidth * width);
+    const y1 = Math.round(box.offsetTop / canvas.clientHeight * height);
+    const x2 = Math.round((box.offsetLeft + box.offsetWidth) / canvas.clientWidth * width);
+    const y2 = Math.round((box.offsetTop + box.offsetHeight) / canvas.clientHeight * height);
+    qbSync({ type: 'move', id: id, bbox_pixels: [x1, y1, x2, y2] });
+  }
+
+  window.qbStartDrag = function(evt, id) {
+    if (evt.target.closest('.bbox-handle')) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    const box = document.getElementById('box-' + id);
+    const canvas = document.getElementById('bbox-canvas');
+    if (!box || !canvas) return;
+    const startX = evt.clientX, startY = evt.clientY;
+    const startLeft = box.offsetLeft, startTop = box.offsetTop;
+    let moved = false;
+    function onMove(e) {
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
+      const newLeft = qbClamp(startLeft + dx, 0, canvas.clientWidth - box.offsetWidth);
+      const newTop = qbClamp(startTop + dy, 0, canvas.clientHeight - box.offsetHeight);
+      box.style.left = (newLeft / canvas.clientWidth * 100) + '%';
+      box.style.top = (newTop / canvas.clientHeight * 100) + '%';
+      const textPanel = document.getElementById('text-' + id);
+      if (textPanel) {
+        textPanel.style.left = box.style.left;
+        textPanel.style.top = ((newTop + box.offsetHeight) / canvas.clientHeight * 100) + '%';
+      }
+    }
+    function onUp() {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      if (moved) {
+        qbSyncBox(id);
+      } else {
+        qbSync({ type: 'toggle', id: id });
+      }
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+
+  window.qbStartResize = function(evt, id, corner) {
+    evt.preventDefault();
+    evt.stopPropagation();
+    const box = document.getElementById('box-' + id);
+    const canvas = document.getElementById('bbox-canvas');
+    if (!box || !canvas) return;
+    const startX = evt.clientX, startY = evt.clientY;
+    const startLeft = box.offsetLeft, startTop = box.offsetTop;
+    const startWidth = box.offsetWidth, startHeight = box.offsetHeight;
+    const minSize = 12;
+    function onMove(e) {
+      const dx = e.clientX - startX, dy = e.clientY - startY;
+      let left = startLeft, top = startTop, width = startWidth, height = startHeight;
+      if (corner.includes('e')) width = qbClamp(startWidth + dx, minSize, canvas.clientWidth - startLeft);
+      if (corner.includes('s')) height = qbClamp(startHeight + dy, minSize, canvas.clientHeight - startTop);
+      if (corner.includes('w')) {
+        width = qbClamp(startWidth - dx, minSize, startLeft + startWidth);
+        left = startLeft + startWidth - width;
+      }
+      if (corner.includes('n')) {
+        height = qbClamp(startHeight - dy, minSize, startTop + startHeight);
+        top = startTop + startHeight - height;
+      }
+      box.style.left = (left / canvas.clientWidth * 100) + '%';
+      box.style.top = (top / canvas.clientHeight * 100) + '%';
+      box.style.width = (width / canvas.clientWidth * 100) + '%';
+      box.style.height = (height / canvas.clientHeight * 100) + '%';
+      const textPanel = document.getElementById('text-' + id);
+      if (textPanel) {
+        textPanel.style.left = box.style.left;
+        textPanel.style.top = ((top + height) / canvas.clientHeight * 100) + '%';
+      }
+    }
+    function onUp() {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      qbSyncBox(id);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+
+  window.qbCommitText = function(id) {
+    const el = document.getElementById('textarea-' + id);
+    if (!el) return;
+    qbSync({ type: 'text', id: id, text: el.value });
+  };
+}
+"""
 
 
-def draw_annotations(image_path: str, annotation: dict[str, Any], selected: int = -1) -> Image.Image:
+def escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def encode_display_image(image: Image.Image, max_dim: int = 1400) -> str:
+    display = image.copy()
+    display.thumbnail((max_dim, max_dim), Image.LANCZOS)
+    buffer = io.BytesIO()
+    display.save(buffer, format="JPEG", quality=85)
+    data = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/jpeg;base64,{data}"
+
+
+def render_interactive_preview(
+    image_path: str | None,
+    annotation: dict[str, Any],
+    selected: int,
+    active_text_id: str | None,
+) -> str:
+    """Rendert das Bild mit verschieb- und skalierbaren Boxen (Drag/Resize per
+    Maus). Ein Klick auf eine Box blendet ein editierbares Textfeld darunter ein.
+    """
+    if not image_path:
+        return EMPTY_PREVIEW_HTML
     image = open_scan(image_path)
-    draw = ImageDraw.Draw(image)
-    font = get_font(max(16, image.width // 90))
-    colors = {"high": "#24A148", "medium": "#F1C21B", "low": "#DA1E28"}
-    width = max(2, image.width // 700)
+    width, height = image.size
+    data_uri = encode_display_image(image)
+
+    parts = []
     for index, line in enumerate(annotation.get("lines", [])):
-        box = line_to_pixels(line, annotation, image.width, image.height)
-        color = "#0067C0" if index == selected else colors.get(line.get("confidence"), "#DA1E28")
-        draw.rectangle(box, outline=color, width=width * 3 if index == selected else width)
-        label = str(index + 1)
-        anchor = (box[0], max(0, box[1] - 30))
-        text_box = draw.textbbox(anchor, label, font=font)
-        draw.rectangle(text_box, fill=color)
-        draw.text(anchor, label, fill="white", font=font)
-    return image
+        try:
+            x1, y1, x2, y2 = line_to_pixels(line, annotation, width, height)
+        except (KeyError, ValueError):
+            continue
+        left = x1 / width * 100
+        top = y1 / height * 100
+        box_width = (x2 - x1) / width * 100
+        box_height = (y2 - y1) / height * 100
+        line_id = line.get("id") or f"line_{index + 1:04d}"
+        color = SELECTED_COLOR if index == selected else CONFIDENCE_COLORS.get(line.get("confidence"), "#DA1E28")
+        text = str(line.get("text_corrected", ""))
+
+        handles = "".join(
+            f"<div class='bbox-handle bbox-handle-{corner}' "
+            f"onmousedown=\"window.qbStartResize(event,'{line_id}','{corner}')\"></div>"
+            for corner in ("nw", "ne", "sw", "se")
+        )
+
+        text_panel = ""
+        if active_text_id == line_id:
+            text_top = top + box_height
+            text_panel = (
+                f"<div class='bbox-text' id='text-{line_id}' "
+                f"style='left:{left:.3f}%; top:{text_top:.3f}%;'>"
+                f"<textarea id='textarea-{line_id}' class='bbox-textarea' autofocus "
+                f"onblur=\"window.qbCommitText('{line_id}')\">{escape_html(text)}</textarea>"
+                f"</div>"
+            )
+
+        parts.append(
+            f"<div class='bbox-box' id='box-{line_id}' "
+            f"style='left:{left:.3f}%; top:{top:.3f}%; width:{box_width:.3f}%; height:{box_height:.3f}%; border-color:{color};' "
+            f"onmousedown=\"window.qbStartDrag(event,'{line_id}')\">"
+            f"<span class='bbox-label' style='background:{color};'>{index + 1}</span>"
+            f"{handles}"
+            f"</div>"
+            f"{text_panel}"
+        )
+
+    return (
+        f"<div class='bbox-canvas' id='bbox-canvas' data-width='{width}' data-height='{height}'>"
+        f"<img class='bbox-image' src='{data_uri}' draggable='false' />"
+        f"{''.join(parts)}"
+        f"</div>"
+    )
 
 
 def crop_line(image_path: str, annotation: dict[str, Any], selected: int) -> Image.Image | None:
@@ -357,9 +544,10 @@ def start_preannotation(image_path: str | None, model: str, context: int):
             annotation,
             image_path,
             selected,
-            draw_annotations(image_path, annotation, selected),
+            render_interactive_preview(image_path, annotation, selected, None),
             crop_line(image_path, annotation, selected),
             annotation_to_table(annotation),
+            None,
             f"{len(annotation['lines'])} Zeilen erkannt.",
         )
     except requests.ConnectionError as exc:
@@ -412,7 +600,7 @@ def sync_image_state(image_path: str | None):
     PDF-Seite oder Kachel), und verwirft die Annotationsanzeige des vorherigen
     Bildes, damit sie nicht versehentlich unter dem neuen Bildpfad gespeichert wird.
     """
-    return image_path or "", {}, -1, None, None, []
+    return image_path or "", {}, -1, EMPTY_PREVIEW_HTML, None, [], None
 
 
 def load_annotation(image_path: str | None, json_path: str | None):
@@ -422,15 +610,29 @@ def load_annotation(image_path: str | None, json_path: str | None):
         data = json.loads(Path(json_path).read_text(encoding="utf-8"))
         if not data.get("schema_version"):
             data = normalize_annotation(data)
+
+        stored_image = data.get("image")
+        if isinstance(stored_image, dict) and stored_image.get("width") and stored_image.get("height"):
+            actual_width, actual_height = open_scan(image_path).size
+            if (int(stored_image["width"]), int(stored_image["height"])) != (actual_width, actual_height):
+                raise ValueError(
+                    "Diese Annotation wurde für ein Bild mit "
+                    f"{stored_image['width']}x{stored_image['height']} Pixeln erstellt, das "
+                    f"aktuell geladene Bild hat aber {actual_width}x{actual_height} Pixel. "
+                    "Vermutlich passt das falsche Bild (z.B. die falsche Kachel oder PDF-Seite) "
+                    "zu dieser Annotation - bitte das passende Bild laden."
+                )
+
         data = ensure_pixel_boxes(data, image_path)
         selected = 0 if data.get("lines") else -1
         return (
             data,
             image_path,
             selected,
-            draw_annotations(image_path, data, selected),
+            render_interactive_preview(image_path, data, selected, None),
             crop_line(image_path, data, selected),
             annotation_to_table(data),
+            None,
             f"{len(data.get('lines', []))} Zeilen geladen.",
         )
     except Exception as exc:
@@ -454,9 +656,10 @@ def select_row(table: Any, annotation: dict[str, Any], image_path: str, evt: gr.
     index = clamp(index, 0, len(annotation["lines"]) - 1)
     return (
         annotation,
-        draw_annotations(image_path, annotation, index),
+        render_interactive_preview(image_path, annotation, index, None),
         crop_line(image_path, annotation, index),
         index,
+        None,
         f"Ausgewählt: Zeile {index + 1}",
     )
 
@@ -472,7 +675,79 @@ def refresh(table: Any, annotation: dict[str, Any], image_path: str, selected: i
         selected = clamp(int(selected), 0, len(annotation["lines"]) - 1)
     else:
         selected = -1
-    return annotation, draw_annotations(image_path, annotation, selected), crop_line(image_path, annotation, selected), selected, "Änderungen übernommen."
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, selected, None),
+        crop_line(image_path, annotation, selected),
+        selected,
+        None,
+        "Änderungen übernommen.",
+    )
+
+
+def sync_bbox_edit(
+    payload_json: str,
+    annotation: dict[str, Any],
+    image_path: str,
+    selected: int,
+    active_text: str | None,
+):
+    """Wird vom versteckten Sync-Textfeld ausgelöst, sobald im Vorschau-Overlay
+    eine Box verschoben/skaliert oder ihr Text bearbeitet/aufgeklappt wurde.
+    """
+    if not payload_json or not image_path:
+        raise gr.Error("Keine Änderung zum Übernehmen vorhanden.")
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError as exc:
+        raise gr.Error("Ungültige Synchronisationsdaten aus der Vorschau.") from exc
+
+    lines = annotation.get("lines", [])
+    line_id = payload.get("id")
+    index = next((i for i, line in enumerate(lines) if line.get("id") == line_id), -1)
+    if index < 0:
+        raise gr.Error("Zeile wurde in der Annotation nicht gefunden.")
+
+    image = annotation.get("image", {})
+    width = int(image.get("width", 0))
+    height = int(image.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise gr.Error("Die Bildgröße fehlt. Annotation zuerst mit einem Bild laden.")
+
+    action = payload.get("type")
+    if action == "move":
+        try:
+            pixel_box = validate_pixel_bbox(payload.get("bbox_pixels"), width, height)
+        except (TypeError, ValueError) as exc:
+            raise gr.Error(str(exc)) from exc
+        lines[index]["bbox_pixels"] = pixel_box
+        lines[index]["bbox_1000"] = pixels_to_bbox_1000(pixel_box, width, height)
+        selected = index
+        status = f"Box {index + 1} verschoben/skaliert."
+    elif action == "text":
+        corrected = str(payload.get("text", "")).strip()
+        lines[index]["text_corrected"] = corrected
+        predicted = lines[index].get("text_predicted", corrected)
+        lines[index]["status"] = "corrected" if corrected != predicted else "confirmed"
+        selected = index
+        status = f"Text für Zeile {index + 1} aktualisiert."
+    elif action == "toggle":
+        active_text = None if active_text == line_id else line_id
+        selected = index
+        status = f"Zeile {index + 1} ausgewählt." if active_text else "Textfeld geschlossen."
+    else:
+        raise gr.Error("Unbekannte Aktion aus der Vorschau.")
+
+    annotation["lines"] = lines
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, selected, active_text),
+        crop_line(image_path, annotation, selected),
+        annotation_to_table(annotation),
+        selected,
+        active_text,
+        status,
+    )
 
 
 def save_annotation(table: Any, annotation: dict[str, Any], image_path: str, model: str):
@@ -575,8 +850,9 @@ def build_interface() -> gr.Blocks:
         annotation_state = gr.State({})
         image_state = gr.State("")
         selected_state = gr.State(-1)
+        active_text_state = gr.State(None)
         tile_paths_state = gr.State([])
-        gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.")
+        gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
         with gr.Row():
             with gr.Column(scale=1):
                 image = gr.Image(label="Originalscan", type="filepath", sources=["upload"])
@@ -594,7 +870,11 @@ def build_interface() -> gr.Blocks:
                 existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
                 load = gr.Button("Scan und JSON laden")
             with gr.Column(scale=2):
-                preview = gr.Image(label="Zeilenboxen", type="pil", interactive=False)
+                preview = gr.HTML(EMPTY_PREVIEW_HTML, label="Zeilenboxen", elem_id="bbox-preview-wrap")
+                # visible=False would unmount this element in Gradio 6, breaking the
+                # JS->Python bridge from render_interactive_preview; hide via CSS instead
+                # so it stays queryable while a box is dragged/resized/edited.
+                bbox_sync = gr.Textbox(elem_id="bbox-sync-box", visible=True, container=False)
                 crop = gr.Image(label="Ausgewählte Zeile", type="pil", interactive=False, height=180)
                 table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number"], column_count=(7, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
         with gr.Row():
@@ -609,16 +889,26 @@ def build_interface() -> gr.Blocks:
             training_file = gr.File(label="Qwen-Trainings-JSONL")
         status = gr.Textbox(label="Status", interactive=False)
 
-        image.change(sync_image_state, [image], [image_state, annotation_state, selected_state, preview, crop, table])
+        image.change(sync_image_state, [image], [image_state, annotation_state, selected_state, preview, crop, table, active_text_state])
         pdf_load.click(load_pdf_page, [pdf_upload, pdf_page], [image, status])
         split_button.click(split_into_tiles, [image], [tile_paths_state, status])
         load_tile_button.click(load_tile, [tile_paths_state, tile_number], [image, status])
-        preannotate.click(start_preannotation, [image, model, context], [annotation_state, image_state, selected_state, preview, crop, table, status])
-        load.click(load_annotation, [image, existing], [annotation_state, image_state, selected_state, preview, crop, table, status])
-        table.select(select_row, [table, annotation_state, image_state], [annotation_state, preview, crop, selected_state, status])
-        refresh_button.click(refresh, [table, annotation_state, image_state, selected_state], [annotation_state, preview, crop, selected_state, status])
+        preannotate.click(start_preannotation, [image, model, context], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
+        load.click(load_annotation, [image, existing], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
+        table.select(select_row, [table, annotation_state, image_state], [annotation_state, preview, crop, selected_state, active_text_state, status])
+        refresh_button.click(refresh, [table, annotation_state, image_state, selected_state], [annotation_state, preview, crop, selected_state, active_text_state, status])
+        # .change() (not .input()) is required here: Gradio only fires .input()
+        # for events it recognizes as genuine keystrokes, so the synthetic
+        # DOM events our JS dispatches after a drag/resize/text-edit only
+        # reach the backend through .change().
+        bbox_sync.change(
+            sync_bbox_edit,
+            [bbox_sync, annotation_state, image_state, selected_state, active_text_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+        )
         save_button.click(save_annotation, [table, annotation_state, image_state, model], [annotation_state, annotation_file, status])
         export_button.click(export_jsonl, [table, annotation_state, image_state, dataset_root, export_mode], [annotation_state, training_file, status])
+        app.load(None, None, None, js=BBOX_JS)
     return app
 
 
@@ -628,7 +918,13 @@ def main() -> None:
     parser.add_argument("--port", default=7860, type=int)
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args()
-    build_interface().launch(server_name=args.host, server_port=args.port, share=args.share, inbrowser=True)
+    build_interface().launch(
+        server_name=args.host,
+        server_port=args.port,
+        share=args.share,
+        inbrowser=True,
+        head=BBOX_STYLE,
+    )
 
 
 if __name__ == "__main__":

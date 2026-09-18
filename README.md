@@ -121,6 +121,17 @@ den restlichen Dateien fortgefahren.
 
 Beim erneuten Export derselben Bilddatei wird deren vorhandener JSONL-Datensatz ersetzt, nicht verdoppelt.
 
+## Trainings-JSONL aus einem ganzen Ordner zusammenfassen
+
+`python qwen_export_dataset.py C:\Handschrift-Dataset` durchsucht den angegebenen Ordner
+rekursiv nach allen `*_annotation.json`-Dateien – also nur von einem Menschen in der
+Oberfläche geprüften und gespeicherten Annotationen, nicht den ungeprüften
+`*_preannotation.json`-Dateien – und schreibt sie gesammelt als eine einzige
+`train.jsonl` (Standard: `<Ordner>\train.jsonl`). Optionen: `--dataset-root` für relative
+Bildpfade (Standard: der durchsuchte Ordner) und `--output` für einen anderen Dateinamen.
+Fehlerhafte oder leere Annotationsdateien werden mit Warnung übersprungen, nicht die
+gesamte Zusammenfassung abgebrochen.
+
 ## Datenschutz
 
 Standardmäßig bindet Gradio nur an `127.0.0.1`. Für vertrauliche Scans `--share` nicht benutzen. Ollama wird lokal über `127.0.0.1:11434` angesprochen.
