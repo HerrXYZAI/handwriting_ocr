@@ -16,6 +16,7 @@ import requests
 from PIL import Image, ImageOps
 
 import pdf_utils
+import tesseract_boxes
 from tiling import Tile, create_tiles, save_tiles
 
 OLLAMA_API = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434/api/chat")
@@ -373,6 +374,26 @@ def finalize_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return ordered
 
 
+def maybe_adjust_with_tesseract(
+    args: argparse.Namespace, image_path: Path, lines: list[dict[str, Any]], width: int, height: int
+) -> list[dict[str, Any]]:
+    """Wendet bei --tesseract-adjust zusätzlich Snap+Fill an (siehe
+    tesseract_boxes.py). Ein nicht erreichbarer Dienst oder sonstiger Fehler
+    wird nur protokolliert - er darf den sonst erfolgreichen Qwen-Lauf nicht
+    abbrechen."""
+    if not args.tesseract_adjust:
+        return lines
+    try:
+        new_lines, status = tesseract_boxes.detect_and_adjust(
+            image_path, lines, width, height, lang=args.tesseract_lang, psm=args.tesseract_psm
+        )
+    except Exception as error:
+        LOG.warning("Tesseract-Anpassung übersprungen: %s", error)
+        return lines
+    LOG.info("Tesseract-Anpassung: %s", status)
+    return finalize_lines(new_lines)
+
+
 def build_processing_block(args: argparse.Namespace, log_file: Path, tile_count: int) -> dict[str, Any]:
     return {
         "model": args.model,
@@ -396,20 +417,6 @@ def resolve_page_paths(args: argparse.Namespace, source: Path) -> tuple[Path, Pa
 
 def is_supported_input(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTENSIONS or pdf_utils.is_pdf(path)
-
-
-def has_existing_preannotation(source: Path) -> bool:
-    """Prüft, ob für diese Datei bereits eine Vorannotation existiert (einzeln,
-    in Kacheln oder als PDF-Seiten), damit ein Ordnerlauf sie überspringen kann."""
-    if source.with_name(source.stem + "_preannotation.json").exists():
-        return True
-    tiles_dir = source.with_name(f"{source.stem}_tiles")
-    if tiles_dir.is_dir() and any(tiles_dir.glob("*_preannotation.json")):
-        return True
-    pages_dir = source.with_name(f"{source.stem}_pages")
-    if pages_dir.is_dir() and any(pages_dir.glob("**/*_preannotation.json")):
-        return True
-    return False
 
 
 def iter_folder_inputs(folder: Path) -> list[Path]:
@@ -436,13 +443,16 @@ def process_folder(args: argparse.Namespace, folder: Path) -> list[Path]:
     if not items:
         raise ValueError(f"Keine Bild- oder PDF-Dateien in {folder} gefunden.")
 
+    # Kein Vorab-Filter auf Dateiebene mehr: process_page()/process_tiled_page()
+    # überspringen jede einzelne Seite bzw. Kachel selbst, wenn deren eigene
+    # _preannotation.json schon existiert (siehe dort). Ein Dateiebenen-Filter
+    # ("irgendeine Seite/Kachel hat schon eine Datei -> ganze Datei überspringen")
+    # würde bei einem nur teilweise verarbeiteten mehrseitigen PDF oder groß-
+    # formatigen Bild dazu führen, dass die fehlenden Seiten/Kacheln dauerhaft nie
+    # nachgeholt werden - das war der Bug, der noch fehlende PDF-Seiten für immer
+    # unverarbeitet ließ, sobald mindestens eine Seite bereits vorannotiert war.
     outputs: list[Path] = []
-    skipped = 0
     for index, item in enumerate(items, 1):
-        if has_existing_preannotation(item):
-            print(f"[{index}/{len(items)}] Übersprungen (bereits vorannotiert): {item.name}")
-            skipped += 1
-            continue
         print(f"[{index}/{len(items)}] Verarbeite: {item.name}")
         item_args = argparse.Namespace(**vars(args))
         item_args.image = str(item)
@@ -451,7 +461,7 @@ def process_folder(args: argparse.Namespace, folder: Path) -> list[Path]:
         except Exception as error:
             print(f"FEHLER bei {item.name}: {error}", file=sys.stderr)
 
-    print(f"Ordner fertig: {len(outputs)} Datei(en) erzeugt, {skipped} bereits vorhandene Datei(en) übersprungen.")
+    print(f"Ordner fertig: {len(items)} Datei(en) verarbeitet (bereits vorhandene Seiten/Kacheln je Datei einzeln übersprungen, siehe Ausgabe/Log oben).")
     return outputs
 
 
@@ -495,6 +505,11 @@ def process_page(args: argparse.Namespace, source: Path) -> list[Path]:
         )
 
     output, log_file = resolve_page_paths(args, source)
+
+    if len(tiles) == 1 and output.is_file() and not args.force:
+        print(f"Bereits vorhanden, übersprungen: {output}")
+        return [output]
+
     configure_logging(log_file, args.verbose)
     LOG.info("Start: %s", source)
     LOG.info("Ollama API: %s", OLLAMA_API)
@@ -524,6 +539,8 @@ def process_untiled_page(
         if not args.continue_on_error:
             raise
         lines = []
+
+    lines = maybe_adjust_with_tesseract(args, source, lines, page_width, page_height)
 
     document = {
         "schema_version": "1.3",
@@ -558,6 +575,12 @@ def process_tiled_page(
     outputs: list[Path] = []
 
     for tile, tile_image_path in zip(tiles, tile_paths):
+        tile_output_path = tile_image_path.with_name(tile_image_path.stem + "_preannotation.json")
+        if tile_output_path.is_file() and not args.force:
+            LOG.info("Abschnitt %d bereits vorhanden, übersprungen: %s", tile.index, tile_output_path)
+            outputs.append(tile_output_path)
+            continue
+
         errors: list[dict[str, Any]] = []
         try:
             lines = finalize_lines(run_tile(tile, args))
@@ -569,7 +592,7 @@ def process_tiled_page(
             lines = []
 
         tile_width, tile_height = tile.image.size
-        tile_output_path = tile_image_path.with_name(tile_image_path.stem + "_preannotation.json")
+        lines = maybe_adjust_with_tesseract(args, tile_image_path, lines, tile_width, tile_height)
         document = {
             "schema_version": "1.3",
             "task": "handwritten_line_preannotation",
@@ -646,6 +669,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--upscale", action="store_true", help="Kleine Abschnitte bis max-side hochskalieren")
     parser.add_argument("--continue-on-error", action="store_true", help="Nach Fehler eines Abschnitts fortfahren")
     parser.add_argument("--timeout", type=positive_int, default=1800, help="Read-Timeout je Abschnitt in Sekunden; Standard: 1800")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Bereits vorhandene Vorannotationen (je Seite/Kachel) erneut erzeugen statt sie "
+        "zu überspringen. Ohne diese Option wird jede Seite/Kachel einzeln übersprungen, "
+        "deren _preannotation.json schon existiert - so lässt sich ein abgebrochener oder "
+        "erweiterter Lauf (Einzeldatei, PDF, Kacheln oder Ordner) fortsetzen, ohne bereits "
+        "fertige Seiten/Kacheln erneut an Qwen zu schicken.",
+    )
+    parser.add_argument(
+        "--tesseract-adjust",
+        action="store_true",
+        help="Nach jeder Qwen-Erkennung zusätzlich Tesseract-Boxen abrufen und die "
+        "Zeilenboxen per Snap+Fill anpassen (siehe tesseract_boxes.py); erfordert den "
+        "laufenden Tesseract-Docker-Dienst (docker/tesseract-ocr/). Ein nicht erreichbarer "
+        "Dienst wird nur protokolliert, nicht als Fehler behandelt.",
+    )
+    parser.add_argument(
+        "--tesseract-lang",
+        default=tesseract_boxes.DEFAULT_LANG,
+        help=f"Tesseract-Sprachcode; Standard: {tesseract_boxes.DEFAULT_LANG}",
+    )
+    parser.add_argument(
+        "--tesseract-psm",
+        type=int,
+        default=tesseract_boxes.DEFAULT_PSM,
+        help=f"Tesseract Page-Segmentation-Mode; Standard: {tesseract_boxes.DEFAULT_PSM}",
+    )
     parser.add_argument("--verbose", action="store_true", help="Ausführlicheres Debug-Logging aktivieren")
     return parser
 

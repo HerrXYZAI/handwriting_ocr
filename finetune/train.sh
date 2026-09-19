@@ -9,6 +9,12 @@ MODEL="${FT_MODEL:-Qwen/Qwen3-VL-4B-Instruct}"
 DATASET="${FT_DATASET:-/data/train_swift.jsonl}"
 OUTPUT_DIR="${FT_OUTPUT_DIR:-/output/qwen3-vl-4b-handschrift}"
 EPOCHS="${FT_EPOCHS:-3}"
+# Deckelt die Bildaufloesung vor dem Encoding (Qwen macht daraus ~1 Vision-
+# Token je 28x28px-Patch). Ohne Deckel erzeugen grosse Scans (z.B. 2480x2200)
+# ueber 6000 Bild-Tokens allein und sprengen selbst grosszuegige max_length-
+# Werte, wodurch das Sample beim Laden verworfen wird.
+MAX_PIXELS="${FT_MAX_PIXELS:-1003520}"
+MAX_LENGTH="${FT_MAX_LENGTH:-8192}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -32,7 +38,8 @@ swift sft \
     --per_device_eval_batch_size 1 \
     --gradient_accumulation_steps 16 \
     --learning_rate 1e-4 \
-    --max_length 4096 \
+    --max_pixels "$MAX_PIXELS" \
+    --max_length "$MAX_LENGTH" \
     --eval_steps 50 \
     --save_steps 50 \
     --save_total_limit 2 \

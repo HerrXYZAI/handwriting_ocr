@@ -112,23 +112,52 @@ Schreibt das zusammengeführte, vollständige Modell nach
 
 ## 5. Zurück nach Ollama
 
-Ollama kann nur GGUF laden. Das zusammengeführte Modell muss also noch
-konvertiert werden – dieser Schritt ist (Stand jetzt) nicht Teil dieses
-Ordners, da die GGUF/Vision-Unterstützung für die Qwen3-VL-Modellfamilie in
-llama.cpp sich noch schnell weiterentwickelt. Grober Ablauf, sobald das
-zusammengeführte Modell vorliegt:
+Ollama kann nur GGUF laden. `to_ollama.ps1` übernimmt Konvertierung,
+Quantisierung und Import in einem Rutsch, über das offizielle
+`ghcr.io/ggml-org/llama.cpp:full`-Image (braucht keine GPU, nur Docker):
 
-1. Mit llama.cpp's `convert_hf_to_gguf.py` (Text- und ggf. Vision-/mmproj-Teil
-   getrennt) nach GGUF konvertieren. Vorher prüfen, ob die aktuelle
-   llama.cpp-Version die genutzte Qwen3-VL-Variante bereits unterstützt.
-2. `Modelfile` schreiben:
-   ```
-   FROM ./qwen3-vl-4b-handschrift.gguf
-   ```
-   (plus mmproj-Zeile, falls Vision-Unterstützung als separate Datei vorliegt)
-3. `ollama create qwen3-vl-4b-handschrift -f Modelfile`
-4. In `qwen_annotation_gui.py` / `qwen_preannotate.py` das Modellfeld auf
-   `qwen3-vl-4b-handschrift` statt `qwen3-vl:4b` umstellen.
+```powershell
+cd finetune
+.\to_ollama.ps1 -MergedDir C:\Handschrift-Dataset\finetune-output\qwen3-vl-4b-handschrift\v4-...\checkpoint-3-merged
+```
+
+Optionale Parameter: `-ModelName` (Standard `qwen3-vl-4b-handschrift`),
+`-Quant` (Standard `Q4_K_M`; `Q8_0` ist größer/genauer). Ergebnis liegt in
+einem `gguf`-Ordner neben `-MergedDir` und wird direkt per `ollama create`
+importiert.
+
+Intern macht das Skript nichts anderes, als was du auch manuell tun würdest:
+
+1. `docker run ... llama.cpp:full --convert /model --outfile /gguf/model-f16.gguf --outtype f16`
+   konvertiert das Sprachmodell nach GGUF (braucht llama.cpp-Build `b6887` oder
+   neuer für Qwen3-VL – das offizielle Image ist immer aktuell genug).
+2. Derselbe Aufruf mit zusätzlich `--mmproj` exportiert den Vision-Projektor
+   separat (`mmproj-f16.gguf`).
+3. `docker run ... llama.cpp:full --quantize /gguf/model-f16.gguf /gguf/model-Q4_K_M.gguf Q4_K_M`
+   verkleinert das Sprachmodell; der mmproj-Teil bleibt unquantisiert (f16).
+4. `Modelfile` mit zwei `FROM`-Zeilen (Text-GGUF + mmproj-GGUF) plus
+   `ollama create qwen3-vl-4b-handschrift -f Modelfile`.
+
+Danach in `qwen_annotation_gui.py` / `qwen_preannotate.py` das Modellfeld auf
+`qwen3-vl-4b-handschrift` statt `qwen3-vl:4b` umstellen.
+
+**Bekannte Einschränkung:** Der Import von selbst konvertierten
+Qwen3-VL-GGUF+mmproj-Paaren in Ollama ist (Stand jetzt) nicht durchgehend
+stabil – es gibt offene Ollama-Bugs, bei denen `ollama show` das Modell
+korrekt als vision-fähig anzeigt, eine tatsächliche Bildanfrage den
+Model-Runner aber mit "model runner has unexpectedly stopped" abstürzen
+lässt. Falls das auftritt: das GGUF-Paar stattdessen probeweise direkt mit
+llama.cpp laufen lassen (funktioniert erfahrungsgemäß zuverlässiger, u.a.
+weil bartowski/unsloth genau so ihre Qwen3-VL-GGUFs testen):
+
+```powershell
+docker run --rm -p 8080:8080 -v C:\Handschrift-Dataset\finetune-output\...\gguf:/gguf `
+  ghcr.io/ggml-org/llama.cpp:full --server -m /gguf/model-Q4_K_M.gguf --mmproj /gguf/mmproj-f16.gguf --host 0.0.0.0
+```
+
+Das stellt eine OpenAI-kompatible API auf Port 8080 bereit; `qwen_annotation_gui.py`/
+`qwen_preannotate.py` müssten dafür vorübergehend auf diese API statt Ollama
+umgestellt werden (beide sprechen aktuell nur Ollamas `/api/chat`-Format).
 
 ## Fehlerbehebung
 

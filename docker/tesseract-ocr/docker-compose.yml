@@ -1,0 +1,7 @@
+services:
+  tesseract-ocr:
+    build: .
+    image: handschrift-ocr-tesseract:latest
+    ports:
+      - "8884:8884"
+    restart: unless-stopped

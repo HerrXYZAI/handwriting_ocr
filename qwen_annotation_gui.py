@@ -16,6 +16,7 @@ import requests
 from PIL import Image, ImageOps
 
 import pdf_utils
+import tesseract_boxes
 import tiling
 
 OLLAMA_API = "http://127.0.0.1:11434/api/chat"
@@ -24,6 +25,8 @@ DEFAULT_CONTEXT_SIZE = 4096
 DEFAULT_DATASET_ROOT = r"C:\test\handwriting_ocr\pictures_for_OCR"
 CONFIDENCE_VALUES = {"high", "medium", "low"}
 TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1_px", "y1_px", "x2_px", "y2_px"]
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
+DATASET_FILE_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 
 PREANNOTATION_PROMPT = """
 Analysiere diese gescannte Seite mit deutscher Handschrift.
@@ -267,6 +270,8 @@ def line_to_pixels(
 
 CONFIDENCE_COLORS = {"high": "#24A148", "medium": "#F1C21B", "low": "#DA1E28"}
 SELECTED_COLOR = "#0067C0"
+NO_TEXT_STATUS = "no_text"
+NO_TEXT_COLOR = "#8D8D8D"
 EMPTY_PREVIEW_HTML = "<div class='bbox-empty'>Kein Bild geladen.</div>"
 
 BBOX_STYLE = """
@@ -283,7 +288,19 @@ BBOX_STYLE = """
 .bbox-text { position: absolute; z-index: 20; min-width: 220px; max-width: 420px; }
 .bbox-textarea { width: 100%; min-height: 60px; font-size: 14px; padding: 6px; border: 2px solid #0067C0; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.25); resize: vertical; font-family: inherit; box-sizing: border-box; }
 .bbox-empty { padding: 40px; text-align: center; color: #888; }
-#bbox-sync-box { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; opacity: 0 !important; pointer-events: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; }
+#bbox-sync-box, #file-sync-box-all, #file-sync-box-flagged { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; opacity: 0 !important; pointer-events: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; }
+.file-list { max-height: 260px; overflow-y: auto; border: 1px solid #ddd; border-radius: 6px; }
+.file-list-empty { padding: 16px; text-align: center; color: #888; }
+.file-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; border-bottom: 1px solid #eee; font-size: 13px; }
+.file-row:last-child { border-bottom: none; }
+.file-row:hover { background: rgba(0, 103, 192, 0.1); }
+.file-row.annotated { background: rgba(36, 161, 72, 0.18); }
+.file-row.annotated:hover { background: rgba(36, 161, 72, 0.3); }
+.file-row.active { outline: 2px solid #0067C0; outline-offset: -2px; }
+.file-icon { flex-shrink: 0; }
+.file-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-badge { flex-shrink: 0; font-weight: bold; color: #24A148; }
+.file-badge-pending { color: #F1C21B; }
 </style>
 """
 
@@ -291,13 +308,28 @@ BBOX_JS = """
 () => {
   function qbClamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 
-  function qbSync(payload) {
-    const box = document.querySelector('#bbox-sync-box textarea, #bbox-sync-box input');
+  function qbSyncTo(elemId, payload) {
+    const box = document.querySelector('#' + elemId + ' textarea, #' + elemId + ' input');
     if (!box) return;
     box.value = JSON.stringify(payload);
     box.dispatchEvent(new Event('input', { bubbles: true }));
     box.dispatchEvent(new Event('change', { bubbles: true }));
   }
+
+  function qbSync(payload) {
+    qbSyncTo('bbox-sync-box', payload);
+  }
+
+  window.qbSelectFile = function(el) {
+    const path = el.getAttribute('data-path');
+    const syncId = el.getAttribute('data-sync') || 'file-sync-box-all';
+    if (!path) return;
+    document.querySelectorAll('.file-row.active').forEach((row) => row.classList.remove('active'));
+    document.querySelectorAll('.file-row').forEach((row) => {
+      if (row.getAttribute('data-path') === path) row.classList.add('active');
+    });
+    qbSyncTo(syncId, { path: path });
+  };
 
   function qbSyncBox(id) {
     const box = document.getElementById('box-' + id);
@@ -418,6 +450,96 @@ def escape_html(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def escape_attr(text: str) -> str:
+    return escape_html(text).replace('"', "&quot;")
+
+
+def find_dataset_files(dataset_root: str) -> list[dict[str, Any]]:
+    """Findet rekursiv alle Bilder und PDFs unter dataset_root (inkl. Unterordner
+    wie *_pages und *_tiles), zusammen mit ihrem Annotationsstatus.
+    """
+    if not dataset_root or not dataset_root.strip():
+        return []
+    root = Path(dataset_root)
+    if not root.is_dir():
+        return []
+    entries = []
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in DATASET_FILE_EXTENSIONS:
+            continue
+        entries.append({
+            "path": str(path.resolve()),
+            "relative": path.relative_to(root).as_posix(),
+            "is_pdf": path.suffix.lower() == ".pdf",
+            "annotated": path.with_name(path.stem + "_annotation.json").is_file(),
+            "preannotated": path.with_name(path.stem + "_preannotation.json").is_file(),
+        })
+    entries.sort(key=lambda item: item["relative"].lower())
+    return entries
+
+
+FILE_SYNC_ALL = "file-sync-box-all"
+FILE_SYNC_FLAGGED = "file-sync-box-flagged"
+
+
+def render_file_list(
+    dataset_root: str,
+    selected_path: str | None = None,
+    only_flagged: bool = False,
+    sync_target: str = FILE_SYNC_ALL,
+) -> str:
+    """Rendert die Dateiliste als klickbare HTML-Zeilen; bereits annotierte /
+    freigegebene Dateien (mit vorhandener *_annotation.json) werden grün markiert.
+    Mit only_flagged=True werden nur vor- oder fertig annotierte Dateien gezeigt.
+    """
+    entries = find_dataset_files(dataset_root)
+    if only_flagged:
+        entries = [entry for entry in entries if entry["annotated"] or entry["preannotated"]]
+    if not entries:
+        message = (
+            "Keine vorannotierten oder freigegebenen Dateien gefunden."
+            if only_flagged
+            else "Keine Bilder oder PDFs unter diesem Pfad gefunden."
+        )
+        return f"<div class='file-list-empty'>{message}</div>"
+
+    selected_resolved = str(Path(selected_path).resolve()) if selected_path else None
+    rows = []
+    for entry in entries:
+        classes = ["file-row"]
+        badge = ""
+        if entry["annotated"]:
+            classes.append("annotated")
+            badge = "<span class='file-badge' title='Annotiert / freigegeben'>&#10003;</span>"
+        elif entry["preannotated"]:
+            classes.append("preannotated")
+            badge = "<span class='file-badge file-badge-pending' title='Vorannotiert, noch nicht geprüft'>&#8226;</span>"
+        if selected_resolved and entry["path"] == selected_resolved:
+            classes.append("active")
+        icon = "\U0001F4C4" if entry["is_pdf"] else "\U0001F5BC"
+        rows.append(
+            "<div class='{cls}' data-path=\"{path}\" data-sync=\"{sync}\" onclick=\"window.qbSelectFile(this)\">"
+            "<span class='file-icon'>{icon}</span>"
+            "<span class='file-label'>{label}</span>{badge}"
+            "</div>".format(
+                cls=" ".join(classes),
+                path=escape_attr(entry["path"]),
+                sync=escape_attr(sync_target),
+                icon=icon,
+                label=escape_html(entry["relative"]),
+                badge=badge,
+            )
+        )
+    return f"<div class='file-list'>{''.join(rows)}</div>"
+
+
+def render_file_lists(dataset_root: str, selected_path: str | None = None) -> tuple[str, str]:
+    return (
+        render_file_list(dataset_root, selected_path, only_flagged=False, sync_target=FILE_SYNC_ALL),
+        render_file_list(dataset_root, selected_path, only_flagged=True, sync_target=FILE_SYNC_FLAGGED),
+    )
+
+
 def encode_display_image(image: Image.Image, max_dim: int = 1400) -> str:
     display = image.copy()
     display.thumbnail((max_dim, max_dim), Image.LANCZOS)
@@ -453,7 +575,12 @@ def render_interactive_preview(
         box_width = (x2 - x1) / width * 100
         box_height = (y2 - y1) / height * 100
         line_id = line.get("id") or f"line_{index + 1:04d}"
-        color = SELECTED_COLOR if index == selected else CONFIDENCE_COLORS.get(line.get("confidence"), "#DA1E28")
+        if index == selected:
+            color = SELECTED_COLOR
+        elif line.get("status") == NO_TEXT_STATUS:
+            color = NO_TEXT_COLOR
+        else:
+            color = CONFIDENCE_COLORS.get(line.get("confidence"), "#DA1E28")
         text = str(line.get("text_corrected", ""))
 
         handles = "".join(
@@ -574,6 +701,49 @@ def start_preannotation(image_path: str | None, model: str, context: int):
         raise gr.Error(str(exc)) from exc
 
 
+def apply_tesseract_boxes(
+    table: Any,
+    annotation: dict[str, Any],
+    image_path: str | None,
+    lang: str,
+    psm: float | int,
+):
+    """Ruft den Tesseract-Docker-Dienst ab und wendet Snap+Fill auf die
+    aktuellen Zeilen an (siehe tesseract_boxes.detect_and_adjust)."""
+    if not image_path:
+        raise gr.Error("Bitte zuerst einen Scan laden.")
+    try:
+        annotation = table_to_annotation(table, annotation)
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+
+    image = annotation.get("image", {})
+    width = int(image.get("width", 0))
+    height = int(image.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise gr.Error("Die Bildgröße fehlt. Annotation zuerst mit einem Bild laden.")
+
+    try:
+        new_lines, status = tesseract_boxes.detect_and_adjust(
+            image_path, annotation.get("lines", []), width, height, lang=lang, psm=int(psm)
+        )
+    except RuntimeError as exc:
+        raise gr.Error(str(exc)) from exc
+
+    annotation = copy.deepcopy(annotation)
+    annotation["lines"] = new_lines
+    selected = 0 if new_lines else -1
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, selected, None),
+        crop_line(image_path, annotation, selected),
+        annotation_to_table(annotation),
+        selected,
+        None,
+        status,
+    )
+
+
 def load_pdf_page(pdf_path: str | None, page_number: float | int | None) -> tuple[str, str]:
     if not pdf_path:
         raise gr.Error("Bitte zuerst ein PDF auswählen.")
@@ -613,12 +783,110 @@ def load_tile(tile_paths: list[str], tile_number: float | int | None) -> tuple[s
     return tile_paths[index], f"Kachel {index + 1} von {len(tile_paths)} geladen."
 
 
-def sync_image_state(image_path: str | None):
-    """Hält image_state synchron, sobald sich der geladene Scan ändert (Upload,
-    PDF-Seite oder Kachel), und verwirft die Annotationsanzeige des vorherigen
-    Bildes, damit sie nicht versehentlich unter dem neuen Bildpfad gespeichert wird.
+def auto_load_existing_annotation(image_path: str):
+    """Sucht neben image_path nach einer vorhandenen <bild>_annotation.json
+    oder <bild>_preannotation.json und lädt sie automatisch.
+
+    Muss mit dem echten Dateipfad im Dataset aufgerufen werden, nicht mit dem
+    von der Gradio-Bildkomponente zurückgelieferten Pfad: Gradio kopiert jedes
+    an sie übergebene Bild in ein eigenes Temp-Verzeichnis (siehe
+    ensure_image_under_dataset_root), sodass ein Geschwisterdatei-Abgleich über
+    image.change() dort nie den echten Ordner (z.B. *_pages/*_tiles) findet.
     """
-    return image_path or "", {}, -1, EMPTY_PREVIEW_HTML, None, [], None
+    stem = Path(image_path)
+    annotation_path = stem.with_name(stem.stem + "_annotation.json")
+    preannotation_path = stem.with_name(stem.stem + "_preannotation.json")
+    source_path = annotation_path if annotation_path.is_file() else preannotation_path if preannotation_path.is_file() else None
+    if source_path is None:
+        return {}, image_path, -1, EMPTY_PREVIEW_HTML, None, [], None, None, "Keine vorhandene Annotation für diese Datei gefunden."
+    try:
+        data, loaded_image_path, selected, preview, crop_img, table_rows, active_text, status = load_annotation(
+            image_path, str(source_path)
+        )
+        return data, loaded_image_path, selected, preview, crop_img, table_rows, active_text, str(source_path), status
+    except gr.Error as exc:
+        return (
+            {}, image_path, -1, EMPTY_PREVIEW_HTML, None, [], None, None,
+            f"{source_path.name} konnte nicht automatisch geladen werden: {exc}",
+        )
+
+
+def load_pdf_page_and_autoload(pdf_path: str | None, page_number: float | int | None):
+    image_path, page_status = load_pdf_page(pdf_path, page_number)
+    annotation, image_state_path, selected, preview, crop_img, table_rows, active_text, existing_path, load_status = (
+        auto_load_existing_annotation(image_path)
+    )
+    return (
+        image_path, image_state_path, annotation, selected, preview, crop_img, table_rows, active_text, existing_path,
+        f"{page_status} {load_status}",
+    )
+
+
+def load_tile_and_autoload(tile_paths: list[str], tile_number: float | int | None):
+    image_path, tile_status = load_tile(tile_paths, tile_number)
+    annotation, image_state_path, selected, preview, crop_img, table_rows, active_text, existing_path, load_status = (
+        auto_load_existing_annotation(image_path)
+    )
+    return (
+        image_path, image_state_path, annotation, selected, preview, crop_img, table_rows, active_text, existing_path,
+        f"{tile_status} {load_status}",
+    )
+
+
+def select_dataset_file(payload_json: str, dataset_root: str):
+    """Wird ausgelöst, sobald in der Dateiliste auf einen Eintrag geklickt wird.
+    Lädt Bilder direkt; bei einem PDF wird automatisch dessen erste Seite
+    geladen. Eine bereits vorhandene Annotation wird sofort mit dem echten
+    Dateipfad mitgeladen (siehe auto_load_existing_annotation).
+    """
+    if not payload_json:
+        raise gr.Error("Keine Datei ausgewählt.")
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError as exc:
+        raise gr.Error("Ungültige Auswahl aus der Dateiliste.") from exc
+
+    path = payload.get("path")
+    if not path or not Path(path).is_file():
+        raise gr.Error("Die ausgewählte Datei wurde nicht gefunden.")
+
+    is_pdf = Path(path).suffix.lower() == ".pdf"
+    if is_pdf:
+        image_path, page_status = load_pdf_page(path, 1)
+    else:
+        image_path, page_status = path, "Bild geladen."
+
+    annotation, image_state_path, selected, preview, crop_img, table_rows, active_text, existing_path, load_status = (
+        auto_load_existing_annotation(image_path)
+    )
+    all_html, flagged_html = render_file_lists(dataset_root, path)
+    return (
+        image_path,
+        image_state_path,
+        annotation,
+        selected,
+        preview,
+        crop_img,
+        table_rows,
+        active_text,
+        existing_path,
+        path if is_pdf else gr.skip(),
+        1 if is_pdf else gr.skip(),
+        all_html,
+        flagged_html,
+        f"{page_status} {load_status}",
+    )
+
+
+def reset_image_state(image_path: str | None):
+    """Wird nur bei einem echten manuellen Upload/Einfügen in die
+    Bildkomponente ausgelöst (image.upload, nicht image.change) und verwirft
+    die Annotationsanzeige des vorherigen Bildes, damit sie nicht versehentlich
+    unter dem neuen Bildpfad gespeichert wird.
+    """
+    if not image_path:
+        return "", {}, -1, EMPTY_PREVIEW_HTML, None, [], None, None, gr.skip()
+    return image_path, {}, -1, EMPTY_PREVIEW_HTML, None, [], None, None, "Neues Bild geladen."
 
 
 def load_annotation(image_path: str | None, json_path: str | None):
@@ -700,6 +968,136 @@ def refresh(table: Any, annotation: dict[str, Any], image_path: str, selected: i
         selected,
         None,
         "Änderungen übernommen.",
+    )
+
+
+NEW_BOX_WIDTH_FRACTION = 0.2
+NEW_BOX_HEIGHT_FRACTION = 0.03
+NEW_BOX_MIN_SIZE = 15
+
+
+def _default_new_box(width: int, height: int) -> list[int]:
+    """Platziert eine neue Box mittig im Bild, grob in Textzeilen-Proportionen;
+    der Nutzer verschiebt/skaliert sie danach per Maus in der Vorschau."""
+    box_width = clamp(round(width * NEW_BOX_WIDTH_FRACTION), NEW_BOX_MIN_SIZE, width)
+    box_height = clamp(round(height * NEW_BOX_HEIGHT_FRACTION), NEW_BOX_MIN_SIZE, height)
+    x1 = (width - box_width) // 2
+    y1 = (height - box_height) // 2
+    return [x1, y1, x1 + box_width, y1 + box_height]
+
+
+def _unique_line_id(lines: list[dict[str, Any]]) -> str:
+    existing_ids = {line.get("id") for line in lines}
+    number = len(lines) + 1
+    new_id = f"line_{number:04d}"
+    while new_id in existing_ids:
+        number += 1
+        new_id = f"line_{number:04d}"
+    return new_id
+
+
+def add_box(table: Any, annotation: dict[str, Any], image_path: str):
+    if not image_path:
+        raise gr.Error("Kein Bild geladen.")
+    try:
+        annotation = table_to_annotation(table, annotation)
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+
+    image = annotation.get("image", {})
+    width = int(image.get("width", 0))
+    height = int(image.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise gr.Error("Die Bildgröße fehlt. Annotation zuerst mit einem Bild laden.")
+
+    lines = annotation.get("lines", [])
+    box = _default_new_box(width, height)
+    new_line = {
+        "id": _unique_line_id(lines),
+        "bbox_pixels": box,
+        "bbox_1000": pixels_to_bbox_1000(box, width, height),
+        "text_predicted": "",
+        "text_corrected": "",
+        "confidence": "low",
+        "status": "unreviewed",
+    }
+    lines = lines + [new_line]
+    annotation["lines"] = lines
+    selected = len(lines) - 1
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, selected, None),
+        crop_line(image_path, annotation, selected),
+        annotation_to_table(annotation),
+        selected,
+        None,
+        f"{new_line['id']} hinzugefügt - Position/Größe in der Vorschau anpassen.",
+    )
+
+
+def delete_box(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    if not image_path:
+        raise gr.Error("Kein Bild geladen.")
+    try:
+        annotation = table_to_annotation(table, annotation)
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+
+    lines = annotation.get("lines", [])
+    index = int(selected)
+    if index < 0 or index >= len(lines):
+        raise gr.Error("Bitte zuerst eine Zeile auswählen (Tabellenzeile oder Box anklicken).")
+
+    removed_id = lines[index].get("id") or f"Zeile {index + 1}"
+    lines = lines[:index] + lines[index + 1 :]
+    annotation["lines"] = lines
+    new_selected = clamp(index, 0, len(lines) - 1) if lines else -1
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, new_selected, None),
+        crop_line(image_path, annotation, new_selected),
+        annotation_to_table(annotation),
+        new_selected,
+        None,
+        f"{removed_id} gelöscht.",
+    )
+
+
+def mark_no_text(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    """Markiert die ausgewählte Zeile als 'kein sichtbarer Text' (z.B. Stempel,
+    Wasserzeichen, leerer Rand): Text wird geleert, Status auf no_text gesetzt,
+    Box in der Vorschau grau statt konfidenzfarben dargestellt. Wird der Text
+    später wieder bearbeitet, setzen die normalen Textbearbeitungspfade den
+    Status automatisch auf corrected/confirmed zurück - kein separater
+    "Entmarkieren"-Button nötig. Da training_answer() nur Zeilen mit
+    nicht-leerem text_corrected exportiert, wird die Zeile dadurch zugleich
+    vom Training ausgeschlossen.
+    """
+    if not image_path:
+        raise gr.Error("Kein Bild geladen.")
+    try:
+        annotation = table_to_annotation(table, annotation)
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+
+    lines = annotation.get("lines", [])
+    index = int(selected)
+    if index < 0 or index >= len(lines):
+        raise gr.Error("Bitte zuerst eine Zeile auswählen (Tabellenzeile oder Box anklicken).")
+
+    line = lines[index]
+    line["text_corrected"] = ""
+    line["status"] = NO_TEXT_STATUS
+    annotation["lines"] = lines
+    line_id = line.get("id") or f"Zeile {index + 1}"
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, index, None),
+        crop_line(image_path, annotation, index),
+        annotation_to_table(annotation),
+        index,
+        None,
+        f"{line_id} als 'kein sichtbarer Text' markiert (grau, vom Training ausgeschlossen).",
     )
 
 
@@ -803,7 +1201,8 @@ def save_annotation(table: Any, annotation: dict[str, Any], image_path: str, mod
         annotation = add_metadata(table_to_annotation(table, annotation), image_path, model)
         output = Path(image_path).with_name(Path(image_path).stem + "_annotation.json")
         output.write_text(json.dumps(annotation, ensure_ascii=False, indent=2), encoding="utf-8")
-        return annotation, str(output), f"Annotation gespeichert: {output}", image_path
+        all_html, flagged_html = render_file_lists(dataset_root, image_path)
+        return annotation, str(output), f"Annotation gespeichert: {output}", image_path, all_html, flagged_html
     except Exception as exc:
         raise gr.Error(f"Speichern fehlgeschlagen: {exc}") from exc
 
@@ -900,9 +1299,32 @@ def build_interface() -> gr.Blocks:
         active_text_state = gr.State(None)
         tile_paths_state = gr.State([])
         gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
+        with gr.Accordion("Dateien im Dataset (Bilder & PDFs, inkl. Unterordner) - annotierte/freigegebene Dateien grün", open=True):
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("**Alle Dateien**")
+                    file_list_all_html = gr.HTML(
+                        render_file_list(DEFAULT_DATASET_ROOT, sync_target=FILE_SYNC_ALL),
+                        elem_id="file-list-all-wrap",
+                    )
+                with gr.Column():
+                    gr.Markdown("**Nur vorannotiert / annotiert**")
+                    file_list_flagged_html = gr.HTML(
+                        render_file_list(DEFAULT_DATASET_ROOT, only_flagged=True, sync_target=FILE_SYNC_FLAGGED),
+                        elem_id="file-list-flagged-wrap",
+                    )
+            file_sync_all = gr.Textbox(elem_id=FILE_SYNC_ALL, visible=True, container=False)
+            file_sync_flagged = gr.Textbox(elem_id=FILE_SYNC_FLAGGED, visible=True, container=False)
+            refresh_files_button = gr.Button("Dateilisten aktualisieren")
         with gr.Row():
             with gr.Column(scale=1):
-                image = gr.Image(label="Originalscan", type="filepath", sources=["upload"])
+                # image_mode=None ist noetig, damit Gradio beim Zurueck-Einlesen des
+                # Pfads (preprocess) den Original-Pfad unveraendert durchreicht: mit dem
+                # Default "RGB" schreibt Gradio jedes Bild, das nicht exakt im PIL-Modus
+                # "RGB" vorliegt (z.B. Graustufen- oder Palette-PNGs aus Scans), still in
+                # ein neues Cache-Temp-File um - dadurch landete die gespeicherte
+                # Annotation nicht mehr neben der Originaldatei/preannotation.json.
+                image = gr.Image(label="Originalscan", type="filepath", sources=["upload"], image_mode=None)
                 with gr.Row():
                     pdf_upload = gr.File(label="PDF-Scan (mehrseitig)", file_types=[".pdf"], type="filepath")
                     pdf_page = gr.Number(label="Seite", value=1, precision=0, minimum=1)
@@ -914,6 +1336,10 @@ def build_interface() -> gr.Blocks:
                 model = gr.Textbox(label="Ollama-Modell", value=DEFAULT_MODEL)
                 context = gr.Number(label="Kontextgröße", value=DEFAULT_CONTEXT_SIZE, precision=0)
                 preannotate = gr.Button("Qwen-Vorannotation starten", variant="primary")
+                with gr.Row():
+                    tesseract_lang = gr.Textbox(label="Tesseract-Sprache", value=tesseract_boxes.DEFAULT_LANG)
+                    tesseract_psm = gr.Number(label="Tesseract PSM", value=tesseract_boxes.DEFAULT_PSM, precision=0)
+                tesseract_button = gr.Button("Tesseract-Boxen anwenden (Snap + Fill)")
                 existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
                 load = gr.Button("Scan und JSON laden")
             with gr.Column(scale=2):
@@ -923,6 +1349,10 @@ def build_interface() -> gr.Blocks:
                 # so it stays queryable while a box is dragged/resized/edited.
                 bbox_sync = gr.Textbox(elem_id="bbox-sync-box", visible=True, container=False)
                 crop = gr.Image(label="Ausgewählte Zeile", type="pil", interactive=False, height=180)
+                with gr.Row():
+                    add_box_button = gr.Button("Box hinzufügen")
+                    delete_box_button = gr.Button("Ausgewählte Box löschen")
+                    no_text_button = gr.Button("Kein sichtbarer Text")
                 table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number"], column_count=(7, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
         with gr.Row():
             refresh_button = gr.Button("Änderungen übernehmen")
@@ -936,14 +1366,51 @@ def build_interface() -> gr.Blocks:
             training_file = gr.File(label="Qwen-Trainings-JSONL")
         status = gr.Textbox(label="Status", interactive=False)
 
-        image.change(sync_image_state, [image], [image_state, annotation_state, selected_state, preview, crop, table, active_text_state])
-        pdf_load.click(load_pdf_page, [pdf_upload, pdf_page], [image, status])
+        # .upload() (not .change()) is required here: only a genuine manual
+        # upload should discard the previous annotation. select_dataset_file /
+        # load_pdf_page_and_autoload / load_tile_and_autoload also assign to
+        # `image` programmatically, which would otherwise retrigger this and
+        # immediately wipe out the annotation they just loaded.
+        image.upload(
+            reset_image_state,
+            [image],
+            [image_state, annotation_state, selected_state, preview, crop, table, active_text_state, existing, status],
+        )
+        pdf_load.click(
+            load_pdf_page_and_autoload,
+            [pdf_upload, pdf_page],
+            [image, image_state, annotation_state, selected_state, preview, crop, table, active_text_state, existing, status],
+        )
         split_button.click(split_into_tiles, [image], [tile_paths_state, status])
-        load_tile_button.click(load_tile, [tile_paths_state, tile_number], [image, status])
+        load_tile_button.click(
+            load_tile_and_autoload,
+            [tile_paths_state, tile_number],
+            [image, image_state, annotation_state, selected_state, preview, crop, table, active_text_state, existing, status],
+        )
         preannotate.click(start_preannotation, [image, model, context], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
+        tesseract_button.click(
+            apply_tesseract_boxes,
+            [table, annotation_state, image_state, tesseract_lang, tesseract_psm],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+        )
         load.click(load_annotation, [image, existing], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
         table.select(select_row, [table, annotation_state, image_state], [annotation_state, preview, crop, selected_state, active_text_state, status])
         refresh_button.click(refresh, [table, annotation_state, image_state, selected_state], [annotation_state, preview, crop, selected_state, active_text_state, status])
+        add_box_button.click(
+            add_box,
+            [table, annotation_state, image_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+        )
+        delete_box_button.click(
+            delete_box,
+            [table, annotation_state, image_state, selected_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+        )
+        no_text_button.click(
+            mark_no_text,
+            [table, annotation_state, image_state, selected_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+        )
         # .change() (not .input()) is required here: Gradio only fires .input()
         # for events it recognizes as genuine keystrokes, so the synthetic
         # DOM events our JS dispatches after a drag/resize/text-edit only
@@ -953,8 +1420,31 @@ def build_interface() -> gr.Blocks:
             [bbox_sync, annotation_state, image_state, selected_state, active_text_state],
             [annotation_state, preview, crop, table, selected_state, active_text_state, status],
         )
-        save_button.click(save_annotation, [table, annotation_state, image_state, model, dataset_root], [annotation_state, annotation_file, status, image_state])
+        save_button.click(
+            save_annotation,
+            [table, annotation_state, image_state, model, dataset_root],
+            [annotation_state, annotation_file, status, image_state, file_list_all_html, file_list_flagged_html],
+        )
         export_button.click(export_jsonl, [table, annotation_state, image_state, dataset_root, export_mode], [annotation_state, training_file, status, image_state])
+        refresh_files_button.click(render_file_lists, [dataset_root, image_state], [file_list_all_html, file_list_flagged_html])
+        dataset_root.change(render_file_lists, [dataset_root, image_state], [file_list_all_html, file_list_flagged_html])
+        file_sync_all.change(
+            select_dataset_file,
+            [file_sync_all, dataset_root],
+            [
+                image, image_state, annotation_state, selected_state, preview, crop, table, active_text_state, existing,
+                pdf_upload, pdf_page, file_list_all_html, file_list_flagged_html, status,
+            ],
+        )
+        file_sync_flagged.change(
+            select_dataset_file,
+            [file_sync_flagged, dataset_root],
+            [
+                image, image_state, annotation_state, selected_state, preview, crop, table, active_text_state, existing,
+                pdf_upload, pdf_page, file_list_all_html, file_list_flagged_html, status,
+            ],
+        )
+        app.load(render_file_lists, [dataset_root, image_state], [file_list_all_html, file_list_flagged_html])
         app.load(None, None, None, js=BBOX_JS)
     return app
 

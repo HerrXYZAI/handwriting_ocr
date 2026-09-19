@@ -51,19 +51,25 @@ echo  Qwen Handschrift-OCR
 echo ===================================================
 echo  1. Annotations-GUI starten
 echo  2. Vorannotation (qwen_preannotate.py)
-echo  3. Trainings-Datensatz exportieren (qwen_export_dataset.py)
-echo  4. Annotation validieren (validate_annotations.py)
-echo  5. Beenden
+echo  3. Annotation validieren (validate_annotations.py)
+echo  4. Tesseract-Dienst starten (Docker, fuer Box-Anpassung)
+echo  5. Trainings-Datensatz exportieren (qwen_export_dataset.py)
+echo  6. Finetuning starten (Docker, in finetune\)
+echo  7. Finetuning-Ergebnis nach Ollama exportieren (Merge-Checkpoint -^> GGUF -^> ollama create)
+echo  8. Beenden
 echo ===================================================
 set "CHOICE="
-set /p CHOICE="Auswahl (1-5, Enter = 1): "
+set /p CHOICE="Auswahl (1-8, Enter = 1): "
 if "%CHOICE%"=="" set "CHOICE=1"
 
 if "%CHOICE%"=="1" goto :gui
 if "%CHOICE%"=="2" goto :preannotate
-if "%CHOICE%"=="3" goto :export
-if "%CHOICE%"=="4" goto :validate
-if "%CHOICE%"=="5" goto :eof
+if "%CHOICE%"=="3" goto :validate
+if "%CHOICE%"=="4" goto :tesseract
+if "%CHOICE%"=="5" goto :export
+if "%CHOICE%"=="6" goto :finetune
+if "%CHOICE%"=="7" goto :to_ollama
+if "%CHOICE%"=="8" goto :eof
 goto :menu
 
 :gui
@@ -120,6 +126,63 @@ echo (Liste aller Optionen: validate_annotations.py --help^). Leer lassen fuer S
 set "VALIDATE_ARGS="
 set /p VALIDATE_ARGS="Zusaetzliche Optionen: "
 "%PYEXE%" validate_annotations.py "%ANNOTATION_FILE%" %VALIDATE_ARGS%
+goto :done
+
+:tesseract
+where docker >nul 2>nul
+if not %errorlevel%==0 (
+  echo Docker wurde nicht gefunden. Bitte Docker Desktop installieren und starten.
+  goto :done
+)
+echo.
+echo Baut bei Bedarf das Image und startet den Tesseract-Dienst im Hintergrund
+echo unter http://127.0.0.1:8884 ^(siehe docker\tesseract-ocr\^).
+docker compose -f docker\tesseract-ocr\docker-compose.yml up -d --build
+goto :done
+
+:finetune
+where docker >nul 2>nul
+if not %errorlevel%==0 (
+  echo Docker wurde nicht gefunden. Bitte Docker Desktop installieren und starten.
+  goto :done
+)
+echo.
+echo Baut bei Bedarf das Image und startet das Finetuning im Vordergrund
+echo ^(siehe finetune\^). Mit Strg+C abbrechen.
+pushd finetune
+docker compose up --build
+popd
+goto :done
+
+:to_ollama
+where docker >nul 2>nul
+if not %errorlevel%==0 (
+  echo Docker wurde nicht gefunden. Bitte Docker Desktop installieren und starten.
+  goto :done
+)
+where powershell >nul 2>nul
+if not %errorlevel%==0 (
+  echo PowerShell wurde nicht gefunden.
+  goto :done
+)
+echo.
+echo Setzt einen bereits per merge.sh zusammengefuehrten Checkpoint voraus
+echo (siehe finetune\README.md, Abschnitt 4 und 5), z.B.
+echo C:\Handschrift-Dataset\finetune-output\qwen3-vl-4b-handschrift\v4-...\checkpoint-3-merged
+set "MERGED_DIR="
+set /p MERGED_DIR="Pfad zum zusammengefuehrten Modell: "
+if "%MERGED_DIR%"=="" (
+  echo Kein Pfad angegeben.
+  goto :done
+)
+set "OLLAMA_MODEL_NAME="
+set /p OLLAMA_MODEL_NAME="Modellname in Ollama (Enter = qwen3-vl-4b-handschrift): "
+set "OLLAMA_QUANT="
+set /p OLLAMA_QUANT="Quantisierung (Enter = Q4_K_M): "
+set "TO_OLLAMA_ARGS=-MergedDir "%MERGED_DIR%""
+if not "%OLLAMA_MODEL_NAME%"=="" set "TO_OLLAMA_ARGS=%TO_OLLAMA_ARGS% -ModelName "%OLLAMA_MODEL_NAME%""
+if not "%OLLAMA_QUANT%"=="" set "TO_OLLAMA_ARGS=%TO_OLLAMA_ARGS% -Quant "%OLLAMA_QUANT%""
+powershell -ExecutionPolicy Bypass -File finetune\to_ollama.ps1 !TO_OLLAMA_ARGS!
 goto :done
 
 :done
