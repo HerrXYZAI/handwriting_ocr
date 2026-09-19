@@ -55,11 +55,12 @@ echo  3. Annotation validieren (validate_annotations.py)
 echo  4. Tesseract-Dienst starten (Docker, fuer Box-Anpassung)
 echo  5. Trainings-Datensatz exportieren (qwen_export_dataset.py)
 echo  6. Finetuning starten (Docker, in finetune\)
-echo  7. Finetuning-Ergebnis nach Ollama exportieren (Merge-Checkpoint -^> GGUF -^> ollama create)
-echo  8. Beenden
+echo  7. Adapter mit Basismodell zusammenfuehren (Docker, finetune\merge.sh)
+echo  8. Zurueck nach Ollama (GGUF konvertieren, quantisieren, importieren)
+echo  9. Beenden
 echo ===================================================
 set "CHOICE="
-set /p CHOICE="Auswahl (1-8, Enter = 1): "
+set /p CHOICE="Auswahl (1-9, Enter = 1): "
 if "%CHOICE%"=="" set "CHOICE=1"
 
 if "%CHOICE%"=="1" goto :gui
@@ -68,8 +69,9 @@ if "%CHOICE%"=="3" goto :validate
 if "%CHOICE%"=="4" goto :tesseract
 if "%CHOICE%"=="5" goto :export
 if "%CHOICE%"=="6" goto :finetune
-if "%CHOICE%"=="7" goto :to_ollama
-if "%CHOICE%"=="8" goto :eof
+if "%CHOICE%"=="7" goto :merge_adapter
+if "%CHOICE%"=="8" goto :to_ollama
+if "%CHOICE%"=="9" goto :eof
 goto :menu
 
 :gui
@@ -154,6 +156,43 @@ docker compose up --build
 popd
 goto :done
 
+:merge_adapter
+where docker >nul 2>nul
+if not %errorlevel%==0 (
+  echo Docker wurde nicht gefunden. Bitte Docker Desktop installieren und starten.
+  goto :done
+)
+call :get_output_dir
+echo.
+echo Fuehrt einen trainierten LoRA-Adapter-Checkpoint mit dem Basismodell
+echo zusammen (siehe finetune\README.md, Abschnitt 4). Pfad relativ zum
+echo OUTPUT_DIR aus finetune\.env eingeben (aktuell: !OUTPUT_DIR_ABS!),
+echo z.B. qwen3-vl-4b-handschrift\checkpoint-3
+set "ADAPTER_REL="
+set /p ADAPTER_REL="Adapter-Checkpoint-Ordner (relativ zu OUTPUT_DIR): "
+if "%ADAPTER_REL%"=="" (
+  echo Kein Pfad angegeben.
+  goto :done
+)
+set "ADAPTER_REL=!ADAPTER_REL:\=/!"
+echo.
+set "MERGE_OUT_REL="
+set /p MERGE_OUT_REL="Ausgabeordner, relativ zu OUTPUT_DIR (Enter = <Checkpoint>-merged): "
+set "MERGE_ARGS="
+if not "%MERGE_OUT_REL%"=="" (
+  set "MERGE_OUT_REL=!MERGE_OUT_REL:\=/!"
+  set "MERGE_ARGS="/output/!MERGE_OUT_REL!""
+)
+pushd finetune
+docker compose run --rm finetune ./merge.sh "/output/!ADAPTER_REL!" !MERGE_ARGS!
+popd
+if "%MERGE_OUT_REL%"=="" (set "MERGE_RESULT_REL=!ADAPTER_REL!-merged") else (set "MERGE_RESULT_REL=!MERGE_OUT_REL!")
+echo.
+echo Zusammengefuehrtes Modell (relativ zu OUTPUT_DIR, fuer den naechsten
+echo Schritt "Zurueck nach Ollama"):
+echo   !MERGE_RESULT_REL!
+goto :done
+
 :to_ollama
 where docker >nul 2>nul
 if not %errorlevel%==0 (
@@ -165,16 +204,19 @@ if not %errorlevel%==0 (
   echo PowerShell wurde nicht gefunden.
   goto :done
 )
+call :get_output_dir
 echo.
 echo Setzt einen bereits per merge.sh zusammengefuehrten Checkpoint voraus
-echo (siehe finetune\README.md, Abschnitt 4 und 5), z.B.
-echo C:\Handschrift-Dataset\finetune-output\qwen3-vl-4b-handschrift\v4-...\checkpoint-3-merged
-set "MERGED_DIR="
-set /p MERGED_DIR="Pfad zum zusammengefuehrten Modell: "
-if "%MERGED_DIR%"=="" (
+echo (siehe finetune\README.md, Abschnitt 4 und 5). Pfad relativ zum
+echo OUTPUT_DIR aus finetune\.env eingeben (aktuell: !OUTPUT_DIR_ABS!),
+echo z.B. qwen3-vl-4b-handschrift\checkpoint-3-merged
+set "MERGED_REL="
+set /p MERGED_REL="Zusammengefuehrtes Modell (relativ zu OUTPUT_DIR): "
+if "%MERGED_REL%"=="" (
   echo Kein Pfad angegeben.
   goto :done
 )
+set "MERGED_DIR=!OUTPUT_DIR_ABS!\%MERGED_REL%"
 set "OLLAMA_MODEL_NAME="
 set /p OLLAMA_MODEL_NAME="Modellname in Ollama (Enter = qwen3-vl-4b-handschrift): "
 set "OLLAMA_QUANT="
@@ -189,3 +231,18 @@ goto :done
 echo.
 pause
 goto :menu
+
+rem Liest OUTPUT_DIR aus finetune\.env (Standard "./output", falls nicht
+rem gesetzt oder die Datei fehlt) und setzt OUTPUT_DIR_ABS auf den
+rem aufgeloesten absoluten Pfad, relativ zu finetune\ ausgewertet.
+:get_output_dir
+set "OUTPUT_DIR_RAW=./output"
+if exist finetune\.env (
+  for /f "usebackq tokens=1,* delims==" %%A in ("finetune\.env") do (
+    if "%%A"=="OUTPUT_DIR" set "OUTPUT_DIR_RAW=%%B"
+  )
+)
+pushd finetune >nul 2>nul
+for %%I in ("%OUTPUT_DIR_RAW%") do set "OUTPUT_DIR_ABS=%%~fI"
+popd >nul 2>nul
+goto :eof

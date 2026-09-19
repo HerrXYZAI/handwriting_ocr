@@ -35,20 +35,34 @@ param(
     [string]$MergedDir,
     [string]$ModelName = "qwen3-vl-4b-handschrift",
     [string]$Quant = "Q4_K_M",
-    [string]$LlamaCppImage = "ghcr.io/ggml-org/llama.cpp:full"
+    [string]$LlamaCppImage = "ghcr.io/ggml-org/llama.cpp:full",
+    [string]$OllamaContainer = "ollama"
 )
 
 $ErrorActionPreference = "Stop"
 
-where.exe docker *>$null
-if ($LASTEXITCODE -ne 0) {
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
     Write-Error "Docker wurde nicht gefunden. Bitte Docker Desktop installieren und starten."
     exit 1
 }
-where.exe ollama *>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "Ollama wurde nicht gefunden. Bitte Ollama installieren und sicherstellen, dass es im PATH liegt."
-    exit 1
+
+# Ollama kann entweder lokal installiert sein (CLI im PATH, spricht ueber
+# OLLAMA_HOST mit dem Server) oder komplett als Docker-Container laufen (z.B.
+# als Teil eines RAG-Setups). Im zweiten Fall gibt es keine lokale "ollama"-
+# CLI, daher faellt dieses Skript auf "docker exec" in den laufenden
+# Container zurueck.
+$OllamaMode = $null
+if (Get-Command ollama -ErrorAction SilentlyContinue) {
+    $OllamaMode = "local"
+} else {
+    $running = docker ps --filter "name=^/${OllamaContainer}$" --format "{{.Names}}" 2>$null
+    if ($running -eq $OllamaContainer) {
+        $OllamaMode = "docker"
+        Write-Host "Ollama-CLI nicht lokal gefunden, verwende laufenden Docker-Container '$OllamaContainer'."
+    } else {
+        Write-Error "Ollama wurde nicht gefunden: weder lokal im PATH noch als laufender Docker-Container '$OllamaContainer'. Bitte Ollama installieren, den Container starten, oder -OllamaContainer mit dem richtigen Namen angeben."
+        exit 1
+    }
 }
 
 if (-not (Test-Path $MergedDir)) {
@@ -56,6 +70,24 @@ if (-not (Test-Path $MergedDir)) {
     exit 1
 }
 $MergedDir = (Resolve-Path $MergedDir).Path
+
+# ms-swift speichert tokenizer_config.json mit einem "extra_special_tokens"-
+# Feld als flache Liste (Feature neuerer Transformers-Versionen; das
+# urspruengliche Qwen3-VL-4B-Instruct-Modell hat dieses Feld gar nicht). Die
+# in llama.cpp:full gebuendelte (aeltere) Transformers-Version erwartet dort
+# ein dict und stuerzt sonst mit "AttributeError: 'list' object has no
+# attribute 'keys'" ab. Das Feld ist reine Zusatz-Metadaten (alle Tokens
+# stehen bereits in tokenizer.json) und kann gefahrlos entfernt werden.
+$TokenizerConfigPath = Join-Path $MergedDir "tokenizer_config.json"
+if (Test-Path $TokenizerConfigPath) {
+    $tokenizerConfig = Get-Content $TokenizerConfigPath -Raw | ConvertFrom-Json
+    if ($tokenizerConfig.PSObject.Properties.Name -contains "extra_special_tokens") {
+        Write-Host "Entferne inkompatibles 'extra_special_tokens'-Feld aus tokenizer_config.json..."
+        $tokenizerConfig.PSObject.Properties.Remove("extra_special_tokens")
+        $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+        [System.IO.File]::WriteAllText($TokenizerConfigPath, ($tokenizerConfig | ConvertTo-Json -Depth 10), $utf8NoBom)
+    }
+}
 
 # GGUF-Dateien landen in einem "gguf"-Ordner neben dem zusammengefuehrten Modell,
 # nicht darin - das Konvertierungsskript wuerde sonst versuchen, die neuen
@@ -88,17 +120,31 @@ $ModelfileContent = "FROM ./$QuantGguf`nFROM ./$MmprojGguf`n"
 Set-Content -Path $ModelfilePath -Value $ModelfileContent -Encoding utf8 -NoNewline
 
 Write-Host "4/4 Importiere als '$ModelName' in Ollama..."
-Push-Location $GgufDir
-try {
-    ollama create $ModelName -f Modelfile
-    if ($LASTEXITCODE -ne 0) { Write-Error "ollama create fehlgeschlagen."; exit 1 }
-} finally {
-    Pop-Location
+if ($OllamaMode -eq "local") {
+    Push-Location $GgufDir
+    try {
+        ollama create $ModelName -f Modelfile
+        if ($LASTEXITCODE -ne 0) { Write-Error "ollama create fehlgeschlagen."; exit 1 }
+    } finally {
+        Pop-Location
+    }
+    $RunHint = "ollama run $ModelName"
+} else {
+    $ContainerDir = "/tmp/ollama-import-$ModelName"
+    docker exec $OllamaContainer sh -c "rm -rf '$ContainerDir' && mkdir -p '$ContainerDir'"
+    if ($LASTEXITCODE -ne 0) { Write-Error "Konnte Import-Verzeichnis im Container '$OllamaContainer' nicht anlegen."; exit 1 }
+    docker cp $ModelfilePath "${OllamaContainer}:${ContainerDir}/Modelfile"
+    docker cp (Join-Path $GgufDir $QuantGguf) "${OllamaContainer}:${ContainerDir}/$QuantGguf"
+    docker cp (Join-Path $GgufDir $MmprojGguf) "${OllamaContainer}:${ContainerDir}/$MmprojGguf"
+    docker exec -w $ContainerDir $OllamaContainer ollama create $ModelName -f Modelfile
+    if ($LASTEXITCODE -ne 0) { Write-Error "ollama create fehlgeschlagen (im Container '$OllamaContainer')."; exit 1 }
+    docker exec $OllamaContainer sh -c "rm -rf '$ContainerDir'"
+    $RunHint = "docker exec -it $OllamaContainer ollama run $ModelName"
 }
 
 Write-Host ""
 Write-Host "Fertig. GGUF-Dateien liegen in: $GgufDir"
-Write-Host "Testen mit: ollama run $ModelName"
+Write-Host "Testen mit: $RunHint"
 Write-Host ""
 Write-Host "Bekannte Einschraenkung: der Import von selbst konvertierten Qwen3-VL-"
 Write-Host "GGUF+mmproj-Paaren in Ollama ist noch nicht durchgehend stabil (Stand"

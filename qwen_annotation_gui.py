@@ -5,6 +5,9 @@ import base64
 import copy
 import io
 import json
+import math
+import mimetypes
+import os
 import re
 import shutil
 import uuid
@@ -19,12 +22,20 @@ import pdf_utils
 import tesseract_boxes
 import tiling
 
-OLLAMA_API = "http://127.0.0.1:11434/api/chat"
+OLLAMA_HOST = "http://127.0.0.1:11434"
+OLLAMA_API = f"{OLLAMA_HOST}/api/chat"
+OLLAMA_TAGS_API = f"{OLLAMA_HOST}/api/tags"
+# 'llamacpp' spricht statt Ollama den OpenAI-kompatiblen llama.cpp-Server an
+# (siehe finetune/README.md, Fallback falls Ollama mit einem selbst
+# konvertierten Qwen3-VL-GGUF+mmproj-Paar abstürzt). Per Umgebungsvariable
+# vor dem GUI-Start umschalten, z.B. "set OCR_BACKEND=llamacpp".
+BACKEND = os.environ.get("OCR_BACKEND", "ollama").strip().lower()
+LLAMACPP_API = os.environ.get("LLAMACPP_API", "http://127.0.0.1:8080/v1/chat/completions")
 DEFAULT_MODEL = "qwen3-vl:4b"
 DEFAULT_CONTEXT_SIZE = 4096
 DEFAULT_DATASET_ROOT = r"C:\test\handwriting_ocr\pictures_for_OCR"
 CONFIDENCE_VALUES = {"high", "medium", "low"}
-TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1_px", "y1_px", "x2_px", "y2_px"]
+TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1_px", "y1_px", "x2_px", "y2_px", "Winkel (°)"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
 DATASET_FILE_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 
@@ -35,9 +46,16 @@ Gib ausschließlich gültiges JSON in diesem Format zurück:
 
 {"lines": [{"bbox_1000": [x1, y1, x2, y2], "text": "erkannter Text", "confidence": "high"}]}
 
-Die Koordinaten müssen auf 0 bis 1000 normalisiert sein. Jede Textzeile erhält
-eine eigene, möglichst eng anliegende Box. Ergänze keine unsichtbaren Wörter.
-Zahlen, Namen und Einheiten nicht plausibilisieren. Unleserliches als
+Die Koordinaten müssen auf 0 bis 1000 normalisiert sein. bbox_1000 beschreibt
+die Box ungedreht (x2-x1 und y2-y1 sind Breite und Höhe um den Mittelpunkt der
+Box). Ist eine Zeile spürbar gedreht/schräg geschrieben (z.B. eine senkrechte
+Randnotiz oder ein schräg aufgeklebter Stempel), ergänze zusätzlich "angle" in
+Grad im Uhrzeigersinn, z.B. 90 für eine Zeile, die von oben nach unten läuft,
+-90 für von unten nach oben, oder ein kleiner Wert wie 8 für nur leicht
+schräg geschriebenen Text; bei normal ausgerichtetem Text "angle" ganz
+weglassen. Jede Textzeile erhält eine eigene, möglichst eng anliegende Box
+(um die ungedrehte Ausrichtung, nicht um die gedrehte). Ergänze keine
+unsichtbaren Wörter. Zahlen, Namen und Einheiten nicht plausibilisieren. Unleserliches als
 [unleserlich], unsichere Wörter mit [?]. Ignoriere automatisch vom Scanner
 oder der Scan-Software hinzugefügte Elemente wie Wasserzeichen, Stempel
 oder Dateinummern und Softwarehinweise am Rand; sie
@@ -59,7 +77,10 @@ TRAINING_PROMPT = """
 Erkenne alle handschriftlichen deutschen Textzeilen auf dieser Seite.
 Gib ausschließlich gültiges JSON mit einer Liste namens lines aus. Jeder
 Eintrag enthält bbox_1000 als [x1,y1,x2,y2] und text. Die Koordinaten sind auf
-0 bis 1000 normalisiert. Sortiere in natürlicher Leserichtung, ergänze keine
+0 bis 1000 normalisiert und beschreiben die Box ungedreht. Ist eine Zeile
+spürbar gedreht/schräg geschrieben, ergänze zusätzlich "angle" in Grad im
+Uhrzeigersinn (weglassen bei normal ausgerichtetem Text). Sortiere in
+natürlicher Leserichtung, ergänze keine
 nicht sichtbaren Wörter und markiere Unleserliches mit [unleserlich].
 Ignoriere automatisch vom Scanner oder der Scan-Software hinzugefügte Elemente
 wie Wasserzeichen, Stempel oder Dateinummern und
@@ -72,6 +93,20 @@ def open_scan(image_path: str | Path) -> Image.Image:
     """Öffnet einen Scan und wendet eine vorhandene EXIF-Ausrichtung an."""
     with Image.open(image_path) as source:
         return ImageOps.exif_transpose(source).convert("RGB")
+
+
+def open_scan_for_display(image_path: str | Path, annotation: dict[str, Any]) -> Image.Image:
+    """Wie open_scan(), dreht das Bild aber zusätzlich um eine noch nicht auf
+    die Datei angewendete Drehung (siehe rotate_page/annotation["image"]
+    ["pending_rotation"]), damit Vorschau und Zeilen-Crop zu den bereits
+    gedrehten Box-Koordinaten passen. Die Datei selbst wird erst beim
+    Speichern der Annotation tatsächlich gedreht.
+    """
+    image = open_scan(image_path)
+    rotation = int(annotation.get("image", {}).get("pending_rotation", 0)) % 360
+    if rotation:
+        image = image.rotate(-rotation, expand=True)
+    return image
 
 
 def encode_image(path: Path) -> str:
@@ -167,6 +202,7 @@ def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
             "text_corrected": text,
             "confidence": confidence,
             "status": "unreviewed",
+            "angle": normalize_angle(item.get("angle", 0)),
         })
     result.sort(key=lambda x: (x["bbox_1000"][1], x["bbox_1000"][0]))
     for number, item in enumerate(result, 1):
@@ -208,6 +244,11 @@ def ensure_pixel_boxes(annotation: dict[str, Any], image_path: str) -> dict[str,
         confidence = str(line.get("confidence", "low")).lower().strip()
         line["confidence"] = confidence if confidence in CONFIDENCE_VALUES else "low"
         line.setdefault("status", "unreviewed")
+        # "rotation" war der Feldname der alten 90°-Schritt-Variante dieses
+        # Features; bereits gespeicherte Werte werden beim Laden übernommen.
+        if "angle" not in line and "rotation" in line:
+            line["angle"] = line.pop("rotation")
+        line["angle"] = normalize_angle(line.get("angle", 0))
 
         try:
             pixel_box = validate_pixel_bbox(line.get("bbox_pixels"), width, height)
@@ -222,10 +263,51 @@ def ensure_pixel_boxes(annotation: dict[str, Any], image_path: str) -> dict[str,
     return result
 
 
+def list_ollama_models() -> list[str]:
+    """Fragt die Ollama-Modellliste ab (siehe finetune/README.md Abschnitt 5
+    für per to_ollama.ps1 importierte, eigene Finetunes). Bei nicht
+    erreichbarem Ollama wird still eine leere Liste geliefert - das
+    Dropdown fällt dann auf DEFAULT_MODEL als freien Text zurück, statt
+    den GUI-Start mit einem Fehler zu blockieren.
+    """
+    if BACKEND == "llamacpp":
+        # Der llama.cpp-Server hat immer genau ein Modell geladen (per -m
+        # beim Containerstart); eine Modellliste wie bei Ollama gibt es
+        # nicht, das "model"-Feld im Request wird ohnehin ignoriert.
+        return []
+    try:
+        response = requests.get(OLLAMA_TAGS_API, timeout=5)
+        response.raise_for_status()
+        data = response.json()
+    except Exception:
+        return []
+    names = sorted({m.get("name") for m in data.get("models", []) if m.get("name")})
+    return names
+
+
+def model_dropdown_choices() -> list[str]:
+    models = list_ollama_models()
+    if DEFAULT_MODEL not in models:
+        models = [DEFAULT_MODEL, *models]
+    return models
+
+
+def refresh_ollama_models():
+    return gr.update(choices=model_dropdown_choices())
+
+
 def run_qwen(image_path: str, model: str, context_size: int) -> dict[str, Any]:
     path = Path(image_path)
     if not path.is_file():
         raise FileNotFoundError(path)
+    if BACKEND == "llamacpp":
+        raw = _run_qwen_llamacpp(path)
+    else:
+        raw = _run_qwen_ollama(path, model, context_size)
+    return normalize_annotation(extract_json(raw))
+
+
+def _run_qwen_ollama(path: Path, model: str, context_size: int) -> str:
     payload = {
         "model": model.strip(),
         "messages": [{
@@ -243,7 +325,42 @@ def run_qwen(image_path: str, model: str, context_size: int) -> dict[str, Any]:
     raw = response.json().get("message", {}).get("content", "")
     if not raw:
         raise RuntimeError("Ollama hat keine Textantwort geliefert.")
-    return normalize_annotation(extract_json(raw))
+    return raw
+
+
+def _run_qwen_llamacpp(path: Path) -> str:
+    """Spricht die OpenAI-kompatible /v1/chat/completions-API von llama.cpp's
+    eigenem Server an (Fallback, falls Ollama mit diesem selbst konvertierten
+    Qwen3-VL-GGUF+mmproj-Paar abstürzt - siehe finetune/README.md)."""
+    payload = {
+        "model": "llamacpp",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": PREANNOTATION_PROMPT},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mimetypes.guess_type(path.name)[0] or 'image/jpeg'};base64,{encode_image(path)}"
+                    },
+                },
+            ],
+        }],
+        "stream": False,
+        "temperature": 0,
+        # llama.cpp's eigener Default ist 1.0 (keine Bestrafung), anders als
+        # Ollamas Modelfile-Default; ohne das kann greedy Decoding (temperature
+        # 0) sich in kurzen Wiederholungsschleifen festfahren.
+        "repeat_penalty": 1.1,
+    }
+    response = requests.post(LLAMACPP_API, json=payload, timeout=1800)
+    if not response.ok:
+        raise RuntimeError(f"llama.cpp-Fehler {response.status_code}: {response.text}")
+    choices = response.json().get("choices") or []
+    raw = choices[0].get("message", {}).get("content", "") if choices else ""
+    if not raw:
+        raise RuntimeError("llama.cpp hat keine Textantwort geliefert.")
+    return raw
 
 
 def add_metadata(annotation: dict[str, Any], image_path: str, model: str) -> dict[str, Any]:
@@ -278,13 +395,19 @@ BBOX_STYLE = """
 <style>
 .bbox-canvas { position: relative; display: inline-block; max-width: 100%; line-height: 0; user-select: none; }
 .bbox-image { display: block; width: 100%; height: auto; max-width: 100%; pointer-events: none; }
-.bbox-box { position: absolute; border-style: solid; border-width: 2px; box-sizing: border-box; cursor: move; }
+.bbox-box { position: absolute; border-style: solid; border-width: 2px; box-sizing: border-box; cursor: move; transform-origin: 50% 50%; }
 .bbox-label { position: absolute; top: -22px; left: -2px; color: white; font-size: 12px; font-weight: bold; padding: 1px 5px; border-radius: 3px; white-space: nowrap; }
 .bbox-handle { position: absolute; width: 10px; height: 10px; background: white; border: 2px solid #0067C0; border-radius: 50%; }
 .bbox-handle-nw { top: -6px; left: -6px; cursor: nwse-resize; }
 .bbox-handle-ne { top: -6px; right: -6px; cursor: nesw-resize; }
 .bbox-handle-sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
 .bbox-handle-se { bottom: -6px; right: -6px; cursor: nwse-resize; }
+.bbox-rotate-handle { position: absolute; top: -34px; left: calc(50% - 6px); width: 12px; height: 12px; background: #0067C0; border: 2px solid white; border-radius: 50%; cursor: grab; box-shadow: 0 1px 3px rgba(0,0,0,.4); }
+.bbox-rotate-handle::after { content: ''; position: absolute; top: 12px; left: 5px; width: 2px; height: 10px; background: #0067C0; }
+.bbox-nudge { position: absolute; top: calc(50% - 9px); width: 18px; height: 18px; line-height: 16px; text-align: center; color: white; background: #0067C0; border: 2px solid white; border-radius: 50%; cursor: pointer; font-size: 13px; font-weight: bold; box-shadow: 0 1px 3px rgba(0,0,0,.4); user-select: none; }
+.bbox-nudge-minus { left: -26px; }
+.bbox-nudge-plus { right: -26px; }
+.bbox-apply-angle { position: absolute; bottom: -20px; left: calc(50% - 15px); width: 30px; height: 16px; line-height: 12px; text-align: center; color: white; background: #24A148; border: 2px solid white; border-radius: 8px; cursor: pointer; font-size: 11px; font-weight: bold; box-shadow: 0 1px 3px rgba(0,0,0,.4); user-select: none; }
 .bbox-text { position: absolute; z-index: 20; min-width: 220px; max-width: 420px; }
 .bbox-textarea { width: 100%; min-height: 60px; font-size: 14px; padding: 6px; border: 2px solid #0067C0; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.25); resize: vertical; font-family: inherit; box-sizing: border-box; }
 .bbox-empty { padding: 40px; text-align: center; color: #888; }
@@ -319,6 +442,28 @@ BBOX_JS = """
   function qbSync(payload) {
     qbSyncTo('bbox-sync-box', payload);
   }
+
+  // Fokussiert die Textarea automatisch, sobald sie neu ins DOM eingefuegt
+  // wird (z.B. nach Klick auf eine Box) - das HTML-Attribut "autofocus"
+  // allein greift bei einem via innerHTML ausgetauschten gr.HTML-Element
+  // nicht zuverlaessig, weil das kein echtes Neuladen der Seite ist.
+  function qbAutofocusTextarea() {
+    const wrap = document.getElementById('bbox-preview-wrap');
+    if (!wrap) {
+      setTimeout(qbAutofocusTextarea, 200);
+      return;
+    }
+    const observer = new MutationObserver(() => {
+      const textarea = wrap.querySelector('.bbox-textarea');
+      if (textarea && document.activeElement !== textarea) {
+        textarea.focus();
+        const end = textarea.value.length;
+        textarea.setSelectionRange(end, end);
+      }
+    });
+    observer.observe(wrap, { childList: true, subtree: true });
+  }
+  qbAutofocusTextarea();
 
   window.qbSelectFile = function(el) {
     const path = el.getAttribute('data-path');
@@ -437,10 +582,53 @@ BBOX_JS = """
     document.addEventListener('mouseup', onUp);
   };
 
+  window.qbStartRotate = function(evt, id) {
+    qbCommitActiveText();
+    evt.preventDefault();
+    evt.stopPropagation();
+    const box = document.getElementById('box-' + id);
+    if (!box) return;
+    // Der Mittelpunkt der (ggf. schon gedrehten) Box bleibt beim Drehen um
+    // sich selbst konstant, deshalb liefert getBoundingClientRect() hier in
+    // jedem Aufruf zuverlaessig denselben Drehpunkt.
+    function angleFromEvent(e) {
+      const rect = box.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dx = e.clientX - cx, dy = e.clientY - cy;
+      // +90, weil der Griff in Ruhestellung (Winkel 0) oberhalb der Box
+      // sitzt (atan2 dafuer -90 liefert) und positive Winkel im
+      // Uhrzeigersinn gezaehlt werden, wie window.qbSync({type:'rotate'}).
+      return Math.atan2(dy, dx) * 180 / Math.PI + 90;
+    }
+    function onMove(e) {
+      box.style.transform = 'rotate(' + angleFromEvent(e) + 'deg)';
+    }
+    function onUp(e) {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      qbSync({ type: 'rotate', id: id, angle: angleFromEvent(e) });
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  };
+
   window.qbCommitText = function(id) {
     const el = document.getElementById('textarea-' + id);
     if (!el) return;
     qbSync({ type: 'text', id: id, text: el.value });
+  };
+
+  window.qbNudgeAngle = function(evt, id, delta) {
+    evt.preventDefault();
+    evt.stopPropagation();
+    qbSync({ type: 'nudge_angle', id: id, delta: delta });
+  };
+
+  window.qbApplyLastAngle = function(evt, id) {
+    evt.preventDefault();
+    evt.stopPropagation();
+    qbSync({ type: 'apply_last_angle', id: id });
   };
 }
 """
@@ -560,7 +748,7 @@ def render_interactive_preview(
     """
     if not image_path:
         return EMPTY_PREVIEW_HTML
-    image = open_scan(image_path)
+    image = open_scan_for_display(image_path, annotation)
     width, height = image.size
     data_uri = encode_display_image(image)
 
@@ -582,19 +770,43 @@ def render_interactive_preview(
         else:
             color = CONFIDENCE_COLORS.get(line.get("confidence"), "#DA1E28")
         text = str(line.get("text_corrected", ""))
+        angle = normalize_angle(line.get("angle", 0))
+        label = f"{index + 1}" if not angle else f"{index + 1} ↻{angle:g}°"
+        transform_style = f" transform: rotate({angle:.2f}deg);" if angle else ""
 
         handles = "".join(
             f"<div class='bbox-handle bbox-handle-{corner}' "
             f"onmousedown=\"window.qbStartResize(event,'{line_id}','{corner}')\"></div>"
             for corner in ("nw", "ne", "sw", "se")
         )
+        rotate_handle = (
+            f"<div class='bbox-rotate-handle' "
+            f"onmousedown=\"window.qbStartRotate(event,'{line_id}')\"></div>"
+        )
+        nudge_buttons = (
+            f"<div class='bbox-nudge bbox-nudge-minus' title='-1°' "
+            f"onmousedown=\"window.qbNudgeAngle(event,'{line_id}',-1)\">&minus;</div>"
+            f"<div class='bbox-nudge bbox-nudge-plus' title='+1°' "
+            f"onmousedown=\"window.qbNudgeAngle(event,'{line_id}',1)\">+</div>"
+        )
+        apply_last_angle_button = (
+            f"<div class='bbox-apply-angle' title='Zuletzt verwendeten Winkel übernehmen' "
+            f"onmousedown=\"window.qbApplyLastAngle(event,'{line_id}')\">∠=</div>"
+        )
 
         text_panel = ""
         if active_text_id == line_id:
-            text_top = top + box_height
+            # Unten an der tatsaechlichen (ggf. gedrehten) Box ausrichten,
+            # nicht an ihrer ungedrehten bbox_pixels-Lage - sonst haengt das
+            # Textfeld bei gedrehten Boxen sichtbar daneben statt darunter.
+            rot_left, _, _, rot_bottom = rotated_box_bounds(
+                (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1, angle
+            )
+            text_left = rot_left / width * 100
+            text_top = rot_bottom / height * 100
             text_panel = (
                 f"<div class='bbox-text' id='text-{line_id}' "
-                f"style='left:{left:.3f}%; top:{text_top:.3f}%;'>"
+                f"style='left:{text_left:.3f}%; top:{text_top:.3f}%;'>"
                 f"<textarea id='textarea-{line_id}' class='bbox-textarea' autofocus "
                 f"onblur=\"window.qbCommitText('{line_id}')\">{escape_html(text)}</textarea>"
                 f"</div>"
@@ -602,10 +814,13 @@ def render_interactive_preview(
 
         parts.append(
             f"<div class='bbox-box' id='box-{line_id}' "
-            f"style='left:{left:.3f}%; top:{top:.3f}%; width:{box_width:.3f}%; height:{box_height:.3f}%; border-color:{color};' "
+            f"style='left:{left:.3f}%; top:{top:.3f}%; width:{box_width:.3f}%; height:{box_height:.3f}%; border-color:{color};{transform_style}' "
             f"onmousedown=\"window.qbStartDrag(event,'{line_id}')\">"
-            f"<span class='bbox-label' style='background:{color};'>{index + 1}</span>"
+            f"<span class='bbox-label' style='background:{color};'>{label}</span>"
             f"{handles}"
+            f"{rotate_handle}"
+            f"{nudge_buttons}"
+            f"{apply_last_angle_button}"
             f"</div>"
             f"{text_panel}"
         )
@@ -618,33 +833,107 @@ def render_interactive_preview(
     )
 
 
+def normalize_angle(value: Any) -> float:
+    """Normalisiert einen Winkel (Grad, im Uhrzeigersinn) auf (-180, 180],
+    z.B. für Werte, die direkt in der Tabelle von Hand eingetragen wurden.
+    Eine Nachkommastelle reicht für die Neigung einer Textzeile locker."""
+    try:
+        degrees = float(value)
+    except (TypeError, ValueError):
+        degrees = 0.0
+    degrees = degrees % 360
+    if degrees > 180:
+        degrees -= 360
+    return round(degrees, 1)
+
+
+def rotated_box_bounds(cx: float, cy: float, w: float, h: float, angle_degrees: float) -> tuple[float, float, float, float]:
+    """Achsenparallele Bounding-Box eines um seinen Mittelpunkt (cx,cy) mit
+    Breite/Höhe (w,h) im Uhrzeigersinn um angle_degrees gedrehten Rechtecks."""
+    angle = math.radians(angle_degrees)
+    cos_a, sin_a = abs(math.cos(angle)), abs(math.sin(angle))
+    half_w = (w * cos_a + h * sin_a) / 2
+    half_h = (w * sin_a + h * cos_a) / 2
+    return cx - half_w, cy - half_h, cx + half_w, cy + half_h
+
+
 def crop_line(image_path: str, annotation: dict[str, Any], selected: int) -> Image.Image | None:
     lines = annotation.get("lines", [])
     if selected < 0 or selected >= len(lines):
         return None
-    image = open_scan(image_path)
-    x1, y1, x2, y2 = line_to_pixels(lines[selected], annotation, image.width, image.height)
+    image = open_scan_for_display(image_path, annotation)
+    line = lines[selected]
+    x1, y1, x2, y2 = line_to_pixels(line, annotation, image.width, image.height)
+    w, h = x2 - x1, y2 - y1
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
     mx, my = max(10, image.width // 70), max(8, image.height // 150)
-    return image.crop((max(0, x1 - mx), max(0, y1 - my), min(image.width, x2 + mx), min(image.height, y2 + my)))
+    angle = normalize_angle(line.get("angle", 0))
+
+    if angle:
+        # Die tatsächliche (gedrehte) Box ragt über ihre ungedrehte
+        # bbox_pixels-Bounding-Box hinaus - erst die AABB der gedrehten Box
+        # aus der Seite ausschneiden, dann geraderücken, damit keine Ecken
+        # des schräg geschriebenen Texts abgeschnitten werden.
+        bx1, by1, bx2, by2 = rotated_box_bounds(cx, cy, w, h, angle)
+    else:
+        bx1, by1, bx2, by2 = x1, y1, x2, y2
+
+    crop = image.crop((
+        max(0, int(bx1) - mx), max(0, int(by1) - my),
+        min(image.width, int(bx2) + mx), min(image.height, int(by2) + my),
+    ))
+    if angle:
+        # PIL rotiert bei positivem Winkel gegen den Uhrzeigersinn - das
+        # macht die im Uhrzeigersinn positive Neigung der Zeile genau
+        # rückgängig, sodass der Text aufrecht/lesbar wird.
+        crop = crop.rotate(angle, expand=True)
+        target_w, target_h = int(w) + 2 * mx, int(h) + 2 * my
+        left = max(0, (crop.width - target_w) // 2)
+        top = max(0, (crop.height - target_h) // 2)
+        crop = crop.crop((left, top, min(crop.width, left + target_w), min(crop.height, top + target_h)))
+    return crop
 
 
 def annotation_to_table(annotation: dict[str, Any]) -> list[list[Any]]:
     return [
-        [line["id"], line["text_corrected"], line["confidence"], *line["bbox_pixels"]]
+        [line["id"], line["text_corrected"], line["confidence"], *line["bbox_pixels"], normalize_angle(line.get("angle", 0))]
         for line in annotation.get("lines", [])
     ]
 
 
-def table_to_annotation(table: Any, annotation: dict[str, Any]) -> dict[str, Any]:
+def table_to_annotation(table: Any, annotation: dict[str, Any], image_path: str | None = None) -> dict[str, Any]:
+    """Übernimmt Tabellenzeilen in die Annotation. annotation["image"] fehlt
+    noch komplett, solange ein frisch geladenes Bild weder vorannotiert noch
+    aus einer vorhandenen JSON geladen wurde (annotation_state == {}) - in
+    dem Fall wird die Bildgröße bei Bedarf direkt aus image_path nachgeladen,
+    damit z.B. "Box hinzufügen" auch ganz ohne vorherige Qwen-Vorannotation
+    funktioniert.
+    """
     result = copy.deepcopy(annotation)
+
+    image = result.get("image")
+    if not isinstance(image, dict):
+        image = {}
+    width = int(image.get("width", 0))
+    height = int(image.get("height", 0))
+    if (width <= 0 or height <= 0) and image_path:
+        actual = open_scan(image_path)
+        width, height = actual.size
+        result["image"] = {
+            **image,
+            "file": str(Path(image_path).resolve()),
+            "file_name": Path(image_path).name,
+            "width": width,
+            "height": height,
+        }
+
     if table is None:
         return result
     if hasattr(table, "values"):
         table = table.values.tolist()
 
-    image = result.get("image", {})
-    width = int(image.get("width", 0))
-    height = int(image.get("height", 0))
+    width = int(result.get("image", {}).get("width", 0))
+    height = int(result.get("image", {}).get("height", 0))
     if width <= 0 or height <= 0:
         raise ValueError("Die Bildgröße fehlt. Annotation zuerst mit einem Bild laden.")
 
@@ -661,6 +950,7 @@ def table_to_annotation(table: Any, annotation: dict[str, Any]) -> dict[str, Any
             confidence = "low"
 
         pixel_box = validate_pixel_bbox(list(row[3:7]), width, height)
+        angle = normalize_angle(row[7]) if len(row) > 7 else normalize_angle(previous.get("angle", 0))
         updated = copy.deepcopy(previous)
         updated.update({
             "id": str(row[0] or f"line_{index + 1:04d}"),
@@ -670,6 +960,7 @@ def table_to_annotation(table: Any, annotation: dict[str, Any]) -> dict[str, Any
             "text_corrected": corrected,
             "confidence": confidence,
             "status": "corrected" if corrected != predicted else "confirmed",
+            "angle": angle,
         })
         lines.append(updated)
 
@@ -708,12 +999,15 @@ def apply_tesseract_boxes(
     lang: str,
     psm: float | int,
 ):
-    """Ruft den Tesseract-Docker-Dienst ab und wendet Snap+Fill auf die
-    aktuellen Zeilen an (siehe tesseract_boxes.detect_and_adjust)."""
+    """Ruft den Tesseract-Docker-Dienst ab und rastet die vorhandenen Zeilen
+    auf die am besten überlappende Tesseract-Box ein (siehe
+    tesseract_boxes.detect_and_adjust). Es werden bewusst keine neuen Zeilen
+    aus unzugeordneten Tesseract-Boxen ergänzt - nur bereits vorhandene
+    Zeilen werden neu positioniert."""
     if not image_path:
         raise gr.Error("Bitte zuerst einen Scan laden.")
     try:
-        annotation = table_to_annotation(table, annotation)
+        annotation = table_to_annotation(table, annotation, image_path)
     except Exception as exc:
         raise gr.Error(str(exc)) from exc
 
@@ -722,10 +1016,16 @@ def apply_tesseract_boxes(
     height = int(image.get("height", 0))
     if width <= 0 or height <= 0:
         raise gr.Error("Die Bildgröße fehlt. Annotation zuerst mit einem Bild laden.")
+    if int(image.get("pending_rotation", 0)) % 360:
+        raise gr.Error(
+            "Diese Seite wurde gedreht, aber noch nicht gespeichert - Tesseract würde "
+            "sonst auf der ungedrehten Datei suchen. Bitte zuerst 'Annotations-JSON "
+            "speichern' klicken."
+        )
 
     try:
         new_lines, status = tesseract_boxes.detect_and_adjust(
-            image_path, annotation.get("lines", []), width, height, lang=lang, psm=int(psm)
+            image_path, annotation.get("lines", []), width, height, lang=lang, psm=int(psm), add_unmatched=False
         )
     except RuntimeError as exc:
         raise gr.Error(str(exc)) from exc
@@ -927,7 +1227,7 @@ def load_annotation(image_path: str | None, json_path: str | None):
 
 def select_row(table: Any, annotation: dict[str, Any], image_path: str, evt: gr.SelectData):
     try:
-        annotation = table_to_annotation(table, annotation)
+        annotation = table_to_annotation(table, annotation, image_path)
     except Exception as exc:
         raise gr.Error(str(exc)) from exc
     event_index = evt.index
@@ -954,7 +1254,7 @@ def refresh(table: Any, annotation: dict[str, Any], image_path: str, selected: i
     if not image_path:
         raise gr.Error("Keine Annotation geladen.")
     try:
-        annotation = table_to_annotation(table, annotation)
+        annotation = table_to_annotation(table, annotation, image_path)
     except Exception as exc:
         raise gr.Error(str(exc)) from exc
     if annotation.get("lines"):
@@ -1000,7 +1300,7 @@ def add_box(table: Any, annotation: dict[str, Any], image_path: str):
     if not image_path:
         raise gr.Error("Kein Bild geladen.")
     try:
-        annotation = table_to_annotation(table, annotation)
+        annotation = table_to_annotation(table, annotation, image_path)
     except Exception as exc:
         raise gr.Error(str(exc)) from exc
 
@@ -1020,6 +1320,7 @@ def add_box(table: Any, annotation: dict[str, Any], image_path: str):
         "text_corrected": "",
         "confidence": "low",
         "status": "unreviewed",
+        "angle": 0.0,
     }
     lines = lines + [new_line]
     annotation["lines"] = lines
@@ -1039,7 +1340,7 @@ def delete_box(table: Any, annotation: dict[str, Any], image_path: str, selected
     if not image_path:
         raise gr.Error("Kein Bild geladen.")
     try:
-        annotation = table_to_annotation(table, annotation)
+        annotation = table_to_annotation(table, annotation, image_path)
     except Exception as exc:
         raise gr.Error(str(exc)) from exc
 
@@ -1063,20 +1364,22 @@ def delete_box(table: Any, annotation: dict[str, Any], image_path: str, selected
     )
 
 
-def mark_no_text(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
-    """Markiert die ausgewählte Zeile als 'kein sichtbarer Text' (z.B. Stempel,
-    Wasserzeichen, leerer Rand): Text wird geleert, Status auf no_text gesetzt,
-    Box in der Vorschau grau statt konfidenzfarben dargestellt. Wird der Text
-    später wieder bearbeitet, setzen die normalen Textbearbeitungspfade den
-    Status automatisch auf corrected/confirmed zurück - kein separater
-    "Entmarkieren"-Button nötig. Da training_answer() nur Zeilen mit
-    nicht-leerem text_corrected exportiert, wird die Zeile dadurch zugleich
-    vom Training ausgeschlossen.
+ROTATE_BOX_NUDGE_DEGREES = 5.0
+
+
+def rotate_box(clockwise: bool, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    """Dreht die ausgewählte Box um ROTATE_BOX_NUDGE_DEGREES° (Feinjustierung
+    per Klick - für frei wählbare Winkel siehe der Dreh-Griff über der Box in
+    der Vorschau, oder direkte Eingabe in der Tabellenspalte "Winkel (°)").
+    Die Box-Rechteckgeometrie (bbox_pixels) bleibt unverändert - nur
+    annotation["lines"][i]["angle"] ändert sich; crop_line() und die
+    Vorschau drehen die Darstellung dementsprechend, damit z.B. eine
+    senkrecht geschriebene Randnotiz lesbar bleibt.
     """
     if not image_path:
         raise gr.Error("Kein Bild geladen.")
     try:
-        annotation = table_to_annotation(table, annotation)
+        annotation = table_to_annotation(table, annotation, image_path)
     except Exception as exc:
         raise gr.Error(str(exc)) from exc
 
@@ -1086,8 +1389,9 @@ def mark_no_text(table: Any, annotation: dict[str, Any], image_path: str, select
         raise gr.Error("Bitte zuerst eine Zeile auswählen (Tabellenzeile oder Box anklicken).")
 
     line = lines[index]
-    line["text_corrected"] = ""
-    line["status"] = NO_TEXT_STATUS
+    delta = ROTATE_BOX_NUDGE_DEGREES if clockwise else -ROTATE_BOX_NUDGE_DEGREES
+    angle = normalize_angle(float(line.get("angle", 0)) + delta)
+    line["angle"] = angle
     annotation["lines"] = lines
     line_id = line.get("id") or f"Zeile {index + 1}"
     return (
@@ -1097,8 +1401,143 @@ def mark_no_text(table: Any, annotation: dict[str, Any], image_path: str, select
         annotation_to_table(annotation),
         index,
         None,
-        f"{line_id} als 'kein sichtbarer Text' markiert (grau, vom Training ausgeschlossen).",
+        f"{line_id}: Winkel auf {angle:g}° gestellt.",
+        angle,
     )
+
+
+def rotate_box_left(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    return rotate_box(False, table, annotation, image_path, selected)
+
+
+def rotate_box_right(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    return rotate_box(True, table, annotation, image_path, selected)
+
+
+def mark_no_text(table: Any, annotation: dict[str, Any], image_path: str):
+    """Markiert eine Seite ganz ohne erkennbaren Text (z.B. leere Seite, reiner
+    Stempel-/Wasserzeichen-Scan ohne jede Handschrift): legt eine einzige,
+    das gesamte Bild umfassende Zeile mit Status no_text an, damit die Seite
+    als geprüft (bewusst leer) gespeichert werden kann statt einfach
+    ungeprüft zu wirken. Da training_answer() nur Zeilen mit nicht-leerem
+    text_corrected exportiert, wird die Seite dadurch zugleich vom Training
+    ausgeschlossen.
+
+    Nur nutzbar, solange die Seite noch keine einzige Box hat - für einzelne
+    leere/falsche Boxen bei sonst beschriebenen Seiten stattdessen
+    "Ausgewählte Box löschen" verwenden.
+    """
+    if not image_path:
+        raise gr.Error("Kein Bild geladen.")
+    try:
+        annotation = table_to_annotation(table, annotation, image_path)
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+
+    if annotation.get("lines"):
+        raise gr.Error(
+            "Diese Seite hat noch Boxen. 'Kein sichtbarer Text' ist nur für Seiten "
+            "ganz ohne Boxen gedacht (z.B. eine leere Seite) - einzelne leere oder "
+            "falsche Boxen stattdessen mit 'Ausgewählte Box löschen' entfernen."
+        )
+
+    image = annotation.get("image", {})
+    width = int(image.get("width", 0))
+    height = int(image.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise gr.Error("Die Bildgröße fehlt. Annotation zuerst mit einem Bild laden.")
+
+    line = {
+        "id": "line_0001",
+        "bbox_pixels": [0, 0, width, height],
+        "bbox_1000": [0, 0, 1000, 1000],
+        "text_predicted": "",
+        "text_corrected": "",
+        "confidence": "low",
+        "status": NO_TEXT_STATUS,
+        "angle": 0.0,
+        "source": "manual",
+    }
+    annotation["lines"] = [line]
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, 0, None),
+        crop_line(image_path, annotation, 0),
+        annotation_to_table(annotation),
+        0,
+        None,
+        "Seite als 'kein sichtbarer Text' markiert (grau, vom Training ausgeschlossen).",
+    )
+
+
+def rotate_bbox_cw(bbox: list[int], old_height: int) -> list[int]:
+    x1, y1, x2, y2 = bbox
+    return [old_height - y2, x1, old_height - y1, x2]
+
+
+def rotate_bbox_ccw(bbox: list[int], old_width: int) -> list[int]:
+    x1, y1, x2, y2 = bbox
+    return [y1, old_width - x2, y2, old_width - x1]
+
+
+def rotate_page(clockwise: bool, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    """Dreht die Seite in der Vorschau um 90°: Boxen und Bildgröße werden
+    sofort mitgedreht (siehe rotate_bbox_cw/ccw), die Bilddatei auf der
+    Festplatte aber erst beim Klick auf "Annotations-JSON speichern"
+    tatsächlich gedreht (siehe save_annotation) - annotation["image"]
+    ["pending_rotation"] merkt sich bis dahin, wie viele Grad noch
+    ausstehen. Bis dahin zeigen Vorschau und Zeilen-Crop (open_scan_for_display)
+    bereits die gedrehte Ansicht, ohne die Originaldatei anzufassen.
+    """
+    if not image_path:
+        raise gr.Error("Kein Bild geladen.")
+    try:
+        annotation = table_to_annotation(table, annotation, image_path)
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+
+    image = annotation.get("image", {})
+    width = int(image.get("width", 0))
+    height = int(image.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise gr.Error("Die Bildgröße fehlt. Annotation zuerst mit einem Bild laden.")
+
+    new_lines = []
+    for line in annotation.get("lines", []):
+        line = dict(line)
+        try:
+            box = list(line["bbox_pixels"])
+        except (KeyError, TypeError):
+            new_lines.append(line)
+            continue
+        new_box = rotate_bbox_cw(box, height) if clockwise else rotate_bbox_ccw(box, width)
+        line["bbox_pixels"] = new_box
+        line["bbox_1000"] = pixels_to_bbox_1000(new_box, height, width)
+        new_lines.append(line)
+    annotation["lines"] = new_lines
+
+    pending = int(image.get("pending_rotation", 0)) + (90 if clockwise else -90)
+    annotation["image"] = {**image, "width": height, "height": width, "pending_rotation": pending % 360}
+
+    selected = clamp(int(selected), 0, len(new_lines) - 1) if new_lines else -1
+    direction = "im Uhrzeigersinn" if clockwise else "gegen den Uhrzeigersinn"
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, selected, None),
+        crop_line(image_path, annotation, selected),
+        annotation_to_table(annotation),
+        selected,
+        None,
+        f"Seite um 90° {direction} gedreht (Vorschau) - wird beim Speichern der Annotation auf die Bilddatei angewendet.",
+    )
+
+
+def rotate_page_left(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    return rotate_page(False, table, annotation, image_path, selected)
+
+
+def rotate_page_right(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    return rotate_page(True, table, annotation, image_path, selected)
 
 
 def sync_bbox_edit(
@@ -1107,9 +1546,14 @@ def sync_bbox_edit(
     image_path: str,
     selected: int,
     active_text: str | None,
+    last_angle: float,
 ):
     """Wird vom versteckten Sync-Textfeld ausgelöst, sobald im Vorschau-Overlay
-    eine Box verschoben/skaliert oder ihr Text bearbeitet/aufgeklappt wurde.
+    eine Box verschoben/skaliert, ihr Text bearbeitet/aufgeklappt oder ihr
+    Winkel geändert wurde. last_angle merkt sich seitenweit den zuletzt per
+    Dreh-Griff/Nudge-Knopf/±5°-Button gesetzten Winkel, damit ihn der
+    "Winkel übernehmen"-Knopf einer anderen Box mit einem Klick übernehmen
+    kann (z.B. für mehrere Zeilen derselben schräg geschriebenen Randnotiz).
     """
     if not payload_json or not image_path:
         raise gr.Error("Keine Änderung zum Übernehmen vorhanden.")
@@ -1151,6 +1595,27 @@ def sync_bbox_edit(
         active_text = None if active_text == line_id else line_id
         selected = index
         status = f"Zeile {index + 1} ausgewählt." if active_text else "Textfeld geschlossen."
+    elif action == "rotate":
+        angle = normalize_angle(payload.get("angle", 0))
+        lines[index]["angle"] = angle
+        last_angle = angle
+        selected = index
+        status = f"Box {index + 1} auf {angle:g}° gedreht."
+    elif action == "nudge_angle":
+        try:
+            delta = float(payload.get("delta", 0))
+        except (TypeError, ValueError):
+            delta = 0.0
+        angle = normalize_angle(float(lines[index].get("angle", 0)) + delta)
+        lines[index]["angle"] = angle
+        last_angle = angle
+        selected = index
+        status = f"Box {index + 1} auf {angle:g}° gedreht."
+    elif action == "apply_last_angle":
+        angle = normalize_angle(last_angle)
+        lines[index]["angle"] = angle
+        selected = index
+        status = f"Box {index + 1}: zuletzt verwendeten Winkel ({angle:g}°) übernommen."
     else:
         raise gr.Error("Unbekannte Aktion aus der Vorschau.")
 
@@ -1163,6 +1628,7 @@ def sync_bbox_edit(
         selected,
         active_text,
         status,
+        last_angle,
     )
 
 
@@ -1198,11 +1664,27 @@ def save_annotation(table: Any, annotation: dict[str, Any], image_path: str, mod
         raise gr.Error("Keine Annotation vorhanden.")
     try:
         image_path = ensure_image_under_dataset_root(image_path, dataset_root)
-        annotation = add_metadata(table_to_annotation(table, annotation), image_path, model)
+        annotation = table_to_annotation(table, annotation, image_path)
+
+        # Eine per rotate_page() nur in der Vorschau gedrehte Seite wird erst
+        # hier tatsächlich auf die Bilddatei angewendet - VOR add_metadata(),
+        # damit dessen ensure_pixel_boxes() beim Neuöffnen der Datei bereits
+        # die neue (gedrehte) Bildgröße sieht und nicht versucht, die längst
+        # gedrehten Box-Koordinaten gegen die alte, ungedrehte Größe zu
+        # validieren.
+        pending_rotation = int(annotation.get("image", {}).get("pending_rotation", 0)) % 360
+        if pending_rotation:
+            rotated = open_scan(image_path).rotate(-pending_rotation, expand=True)
+            save_kwargs = {"quality": 95} if Path(image_path).suffix.lower() in {".jpg", ".jpeg"} else {}
+            rotated.save(image_path, **save_kwargs)
+            annotation["image"]["pending_rotation"] = 0
+
+        annotation = add_metadata(annotation, image_path, model)
         output = Path(image_path).with_name(Path(image_path).stem + "_annotation.json")
         output.write_text(json.dumps(annotation, ensure_ascii=False, indent=2), encoding="utf-8")
         all_html, flagged_html = render_file_lists(dataset_root, image_path)
-        return annotation, str(output), f"Annotation gespeichert: {output}", image_path, all_html, flagged_html
+        rotation_note = " (Bilddatei physisch gedreht)" if pending_rotation else ""
+        return annotation, str(output), f"Annotation gespeichert: {output}{rotation_note}", image_path, all_html, flagged_html
     except Exception as exc:
         raise gr.Error(f"Speichern fehlgeschlagen: {exc}") from exc
 
@@ -1221,8 +1703,17 @@ def training_answer(annotation: dict[str, Any]) -> dict[str, Any]:
     lines = []
     for line in annotation.get("lines", []):
         text = str(line.get("text_corrected", "")).strip()
-        if text:
-            lines.append({"bbox_1000": validate_bbox(line["bbox_1000"]), "text": text})
+        if not text:
+            continue
+        entry = {"bbox_1000": validate_bbox(line["bbox_1000"]), "text": text}
+        # "angle" nur bei spürbar gedrehten Zeilen mit ausgeben (siehe
+        # rotate_box/PREANNOTATION_PROMPT/TRAINING_PROMPT) - hält das
+        # Zielschema für den weit überwiegenden achsenparallelen Regelfall
+        # unverändert zum bisherigen Format.
+        angle = normalize_angle(line.get("angle", 0))
+        if angle:
+            entry["angle"] = angle
+        lines.append(entry)
     lines.sort(key=lambda x: (x["bbox_1000"][1], x["bbox_1000"][0]))
     return {"lines": lines}
 
@@ -1272,7 +1763,13 @@ def export_jsonl(table: Any, annotation: dict[str, Any], image_path: str, datase
         raise gr.Error("Keine Annotation vorhanden.")
     try:
         image_path = ensure_image_under_dataset_root(image_path, dataset_root)
-        annotation = table_to_annotation(table, annotation)
+        annotation = table_to_annotation(table, annotation, image_path)
+        if int(annotation.get("image", {}).get("pending_rotation", 0)) % 360:
+            raise gr.Error(
+                "Diese Seite wurde gedreht, aber noch nicht gespeichert - die "
+                "Bilddatei stimmt sonst nicht mit den Box-Koordinaten überein. "
+                "Bitte zuerst 'Annotations-JSON speichern' klicken."
+            )
         record = training_record(annotation, image_path, dataset_root)
         root = Path(dataset_root).resolve() if dataset_root.strip() else Path(image_path).resolve().parent
         root.mkdir(parents=True, exist_ok=True)
@@ -1298,7 +1795,12 @@ def build_interface() -> gr.Blocks:
         selected_state = gr.State(-1)
         active_text_state = gr.State(None)
         tile_paths_state = gr.State([])
-        gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
+        # Seitenweit zuletzt gesetzter Box-Winkel (Dreh-Griff/Nudge-Knopf/
+        # ±5°-Button), siehe sync_bbox_edit/rotate_box - lässt sich per
+        # "Winkel übernehmen"-Knopf unter jeder Box mit einem Klick auf eine
+        # andere Box anwenden.
+        last_angle_state = gr.State(0.0)
+        gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; der kleine Griff über einer Box dreht sie frei (z.B. für eine schräg geschriebene Zeile); ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
         with gr.Accordion("Dateien im Dataset (Bilder & PDFs, inkl. Unterordner) - annotierte/freigegebene Dateien grün", open=True):
             with gr.Row():
                 with gr.Column():
@@ -1333,13 +1835,25 @@ def build_interface() -> gr.Blocks:
                     split_button = gr.Button("Originalscan in Kacheln aufteilen")
                     tile_number = gr.Number(label="Kachel", value=1, precision=0, minimum=1)
                 load_tile_button = gr.Button("Kachel laden")
-                model = gr.Textbox(label="Ollama-Modell", value=DEFAULT_MODEL)
+                with gr.Row():
+                    rotate_left_button = gr.Button("↺ 90° drehen")
+                    rotate_right_button = gr.Button("↻ 90° drehen")
+                with gr.Row():
+                    model = gr.Dropdown(
+                        label="Ollama-Modell",
+                        choices=model_dropdown_choices(),
+                        value=DEFAULT_MODEL,
+                        allow_custom_value=True,
+                        scale=4,
+                    )
+                    refresh_models_button = gr.Button("🔄", scale=1, min_width=40)
                 context = gr.Number(label="Kontextgröße", value=DEFAULT_CONTEXT_SIZE, precision=0)
                 preannotate = gr.Button("Qwen-Vorannotation starten", variant="primary")
                 with gr.Row():
                     tesseract_lang = gr.Textbox(label="Tesseract-Sprache", value=tesseract_boxes.DEFAULT_LANG)
                     tesseract_psm = gr.Number(label="Tesseract PSM", value=tesseract_boxes.DEFAULT_PSM, precision=0)
-                tesseract_button = gr.Button("Tesseract-Boxen anwenden (Snap + Fill)")
+                tesseract_button = gr.Button("Tesseract-Boxen anwenden (Snap)")
+                undo_tesseract_button = gr.Button("Tesseract-Boxen rückgängig (zurück zur geladenen Annotation)")
                 existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
                 load = gr.Button("Scan und JSON laden")
             with gr.Column(scale=2):
@@ -1352,8 +1866,11 @@ def build_interface() -> gr.Blocks:
                 with gr.Row():
                     add_box_button = gr.Button("Box hinzufügen")
                     delete_box_button = gr.Button("Ausgewählte Box löschen")
-                    no_text_button = gr.Button("Kein sichtbarer Text")
-                table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number"], column_count=(7, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
+                    no_text_button = gr.Button("Seite ohne sichtbaren Text (leere Seite)")
+                with gr.Row():
+                    rotate_box_left_button = gr.Button("↺ Box -5°")
+                    rotate_box_right_button = gr.Button("↻ Box +5°")
+                table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number", "number"], column_count=(8, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
         with gr.Row():
             refresh_button = gr.Button("Änderungen übernehmen")
             save_button = gr.Button("Annotations-JSON speichern")
@@ -1393,9 +1910,24 @@ def build_interface() -> gr.Blocks:
             [table, annotation_state, image_state, tesseract_lang, tesseract_psm],
             [annotation_state, preview, crop, table, selected_state, active_text_state, status],
         )
+        undo_tesseract_button.click(
+            load_annotation,
+            [image_state, existing],
+            [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status],
+        )
         load.click(load_annotation, [image, existing], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
         table.select(select_row, [table, annotation_state, image_state], [annotation_state, preview, crop, selected_state, active_text_state, status])
         refresh_button.click(refresh, [table, annotation_state, image_state, selected_state], [annotation_state, preview, crop, selected_state, active_text_state, status])
+        rotate_left_button.click(
+            rotate_page_left,
+            [table, annotation_state, image_state, selected_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+        )
+        rotate_right_button.click(
+            rotate_page_right,
+            [table, annotation_state, image_state, selected_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+        )
         add_box_button.click(
             add_box,
             [table, annotation_state, image_state],
@@ -1408,8 +1940,18 @@ def build_interface() -> gr.Blocks:
         )
         no_text_button.click(
             mark_no_text,
-            [table, annotation_state, image_state, selected_state],
+            [table, annotation_state, image_state],
             [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+        )
+        rotate_box_left_button.click(
+            rotate_box_left,
+            [table, annotation_state, image_state, selected_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status, last_angle_state],
+        )
+        rotate_box_right_button.click(
+            rotate_box_right,
+            [table, annotation_state, image_state, selected_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status, last_angle_state],
         )
         # .change() (not .input()) is required here: Gradio only fires .input()
         # for events it recognizes as genuine keystrokes, so the synthetic
@@ -1417,8 +1959,8 @@ def build_interface() -> gr.Blocks:
         # reach the backend through .change().
         bbox_sync.change(
             sync_bbox_edit,
-            [bbox_sync, annotation_state, image_state, selected_state, active_text_state],
-            [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+            [bbox_sync, annotation_state, image_state, selected_state, active_text_state, last_angle_state],
+            [annotation_state, preview, crop, table, selected_state, active_text_state, status, last_angle_state],
         )
         save_button.click(
             save_annotation,
@@ -1427,6 +1969,7 @@ def build_interface() -> gr.Blocks:
         )
         export_button.click(export_jsonl, [table, annotation_state, image_state, dataset_root, export_mode], [annotation_state, training_file, status, image_state])
         refresh_files_button.click(render_file_lists, [dataset_root, image_state], [file_list_all_html, file_list_flagged_html])
+        refresh_models_button.click(refresh_ollama_models, None, model)
         dataset_root.change(render_file_lists, [dataset_root, image_state], [file_list_all_html, file_list_flagged_html])
         file_sync_all.change(
             select_dataset_file,

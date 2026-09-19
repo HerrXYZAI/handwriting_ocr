@@ -171,3 +171,15 @@ umgestellt werden (beide sprechen aktuell nur Ollamas `/api/chat`-Format).
 - **Modell-Download hängt/bricht ab**: `HF_HOME` liegt im
   `huggingface-cache`-Volume; bei Abbruch reicht ein erneuter `docker run`
   mit demselben Volume, der Download wird fortgesetzt statt neu gestartet.
+- **`to_ollama.ps1` bricht bei der GGUF-Konvertierung mit
+  `FileNotFoundError: .../model-00001-of-00002.safetensors` ab**: das
+  zusammengeführte Modell in `checkpoint-XXX-merged` ist kaputt – ein Mix aus
+  einem `model.safetensors.index.json` für ein Voll-Präzisions-Modell und
+  einer tatsächlich noch 4-bit-quantisierten `model.safetensors`-Datei.
+  Ursache war ein Bug in `merge.sh` (mittlerweile behoben): `swift export
+  --merge_lora true` übernahm bei QLoRA-Checkpoints automatisch
+  `quant_method=bnb` aus der Trainings-`args.json` und quantisierte das
+  gerade erst korrekt dequantisierte Modell direkt wieder zurück. Falls ein
+  vor diesem Fix erzeugter `checkpoint-XXX-merged`-Ordner noch existiert,
+  diesen löschen und `merge.sh` erneut laufen lassen (das Skript räumt den
+  Zielordner inzwischen auch selbst auf, falls er schon existiert).

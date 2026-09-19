@@ -89,12 +89,15 @@ def adjust_lines_with_tesseract(
     width: int,
     height: int,
     iou_threshold: float = 0.15,
+    add_unmatched: bool = True,
 ) -> tuple[list[dict[str, Any]], int, int]:
-    """Snap + Fill: jede vorhandene Zeile wird auf die am besten überlappende
-    Tesseract-Box "eingerastet" (bbox_pixels/bbox_1000 ersetzt, Text und
-    Konfidenz bleiben unverändert); Tesseract-Boxen ohne ausreichende
-    Überlappung zu einer vorhandenen Zeile werden als neue, unbestätigte
-    Zeilen ergänzt (Text leer, damit sie bei der Prüfung auffallen).
+    """Snap (+ optional Fill): jede vorhandene Zeile wird auf die am besten
+    überlappende Tesseract-Box "eingerastet" (bbox_pixels/bbox_1000 ersetzt,
+    Text und Konfidenz bleiben unverändert). Falls add_unmatched=True werden
+    Tesseract-Boxen ohne ausreichende Überlappung zu einer vorhandenen Zeile
+    zusätzlich als neue, unbestätigte Zeilen ergänzt (Text leer, damit sie
+    bei der Prüfung auffallen); bei add_unmatched=False werden sie verworfen
+    und nur die vorhandenen Zeilen neu positioniert.
 
     Gibt (neue Zeilenliste, Anzahl angepasster Zeilen, Anzahl ergänzter
     Zeilen) zurück.
@@ -123,6 +126,9 @@ def adjust_lines_with_tesseract(
             snapped += 1
 
     added = 0
+    if not add_unmatched:
+        return result, snapped, added
+
     next_number = len(result) + 1
     for index, t_line in enumerate(tesseract_lines):
         if index in used_tesseract:
@@ -156,12 +162,17 @@ def detect_and_adjust(
     height: int,
     lang: str = DEFAULT_LANG,
     psm: int = DEFAULT_PSM,
+    add_unmatched: bool = True,
 ) -> tuple[list[dict[str, Any]], str]:
-    """Ruft Tesseract ab und wendet Snap+Fill auf die übergebenen Zeilen an.
+    """Ruft Tesseract ab und wendet Snap(+Fill) auf die übergebenen Zeilen an.
     Einstiegspunkt für GUI-Button und Batch-CLI gleichermaßen.
     """
     tesseract_lines = detect_lines(image_path, lang=lang, psm=psm)
     if not tesseract_lines:
         return lines, "Tesseract hat keine Textregionen erkannt; Zeilen unverändert."
-    new_lines, snapped, added = adjust_lines_with_tesseract(lines, tesseract_lines, width, height)
-    return new_lines, f"Tesseract: {len(tesseract_lines)} Box(en) erkannt, {snapped} Zeile(n) angepasst, {added} neue Zeile(n) ergänzt."
+    new_lines, snapped, added = adjust_lines_with_tesseract(
+        lines, tesseract_lines, width, height, add_unmatched=add_unmatched
+    )
+    if add_unmatched:
+        return new_lines, f"Tesseract: {len(tesseract_lines)} Box(en) erkannt, {snapped} Zeile(n) angepasst, {added} neue Zeile(n) ergänzt."
+    return new_lines, f"Tesseract: {len(tesseract_lines)} Box(en) erkannt, {snapped} von {len(lines)} vorhandenen Zeile(n) angepasst."

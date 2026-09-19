@@ -20,6 +20,8 @@ import tesseract_boxes
 from tiling import Tile, create_tiles, save_tiles
 
 OLLAMA_API = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434/api/chat")
+LLAMACPP_API = os.environ.get("LLAMACPP_API", "http://127.0.0.1:8080/v1/chat/completions")
+DEFAULT_BACKEND = "ollama"
 DEFAULT_MODEL = "qwen3-vl:4b"
 DEFAULT_CONTEXT = 8192
 DEFAULT_MAX_SIDE = 1024
@@ -32,7 +34,10 @@ Gib ausschließlich gültiges JSON in diesem Format zurück:
 {"lines":[{"bbox_1000":[x1,y1,x2,y2],"text":"erkannter Text","confidence":"high"}]}
 
 Die Koordinaten beziehen sich ausschließlich auf den übergebenen Bildausschnitt
-und sind auf 0 bis 1000 normalisiert. Die Box soll die gesamte sichtbare Zeile
+und sind auf 0 bis 1000 normalisiert und beschreiben die Box ungedreht. Ist
+eine Zeile spürbar gedreht/schräg geschrieben (z.B. eine senkrechte
+Randnotiz), ergänze zusätzlich "angle" in Grad im Uhrzeigersinn (weglassen
+bei normal ausgerichtetem Text). Die Box soll die gesamte sichtbare Zeile
 möglichst eng umschließen. Sortiere von oben nach unten, dann von links nach
 rechts. Ergänze keine nicht sichtbaren Wörter. Zahlen, Namen und Einheiten nicht
 plausibilisieren. Unleserliches als [unleserlich], Unsicheres mit [?] markieren.
@@ -88,6 +93,16 @@ def is_repeating(lines: list[str], min_cycles: int = 15, max_period: int = 4) ->
     return False
 
 
+# Erkennt eine kurze Zeichenfolge (2-50 Zeichen), die sich mindestens 15-mal
+# unmittelbar hintereinander wiederholt - unabhängig von Zeilenumbrüchen.
+# Ergänzt is_repeating()/_check_repetition() (die nur fertige Zeilen
+# vergleichen) für den Fall, dass sich das Modell innerhalb eines einzelnen,
+# nie durch "\n" unterbrochenen JSON-Strings festfährt (z.B. ein Zahlenwert,
+# der endlos wiederholt wird).
+_RAW_REPEAT_RE = re.compile(r"(.{2,50}?)\1{14,}", re.DOTALL)
+_RAW_TAIL_MAX = 1200
+
+
 class RepetitionLoopError(RuntimeError):
     pass
 
@@ -100,12 +115,18 @@ class OllamaLineLogger:
     def __init__(self, tag: str = "OLLAMA") -> None:
         self.tag = tag
         self.buffer = ""
+        self.raw_tail = ""
         self.line_number = 0
         self.recent_lines: list[str] = []
         self.seen_lines: set[str] = set()
         self.repeat_streak = 0
 
     def feed(self, fragment: str) -> None:
+        self.raw_tail = (self.raw_tail + fragment)[-_RAW_TAIL_MAX:]
+        if _RAW_REPEAT_RE.search(self.raw_tail):
+            raise RepetitionLoopError(
+                f"Modell wiederholt eine kurze Zeichenfolge endlos ({self.tag}); Abschnitt abgebrochen."
+            )
         self.buffer += fragment.replace("\r\n", "\n").replace("\r", "\n")
         while "\n" in self.buffer:
             line, self.buffer = self.buffer.split("\n", 1)
@@ -220,7 +241,17 @@ def stop_ollama_model(model: str) -> None:
         LOG.warning("Ollama-Modell '%s' konnte nicht über die API gestoppt werden: %s", model, error)
 
 
-def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_index: int) -> dict[str, Any]:
+def call_qwen(
+    image: Image.Image, model: str, context: int, timeout: int, tile_index: int, backend: str, api_url: str
+) -> dict[str, Any]:
+    if backend == "llamacpp":
+        return _call_llamacpp(image, model, timeout, tile_index, api_url)
+    return _call_ollama(image, model, context, timeout, tile_index, api_url)
+
+
+def _call_ollama(
+    image: Image.Image, model: str, context: int, timeout: int, tile_index: int, api_url: str
+) -> dict[str, Any]:
     payload = {
         "model": model,
         "messages": [{
@@ -235,7 +266,7 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
     LOG.info(
         "Ollama-Anfrage für Abschnitt %d: URL=%s, Modell=%s, Kontext=%d, Bild=%dx%d",
         tile_index,
-        OLLAMA_API,
+        api_url,
         model,
         context,
         image.width,
@@ -252,7 +283,7 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
     first_thinking_seen = False
 
     try:
-        with requests.post(OLLAMA_API, json=payload, stream=True, timeout=(30, timeout)) as response:
+        with requests.post(api_url, json=payload, stream=True, timeout=(30, timeout)) as response:
             if not response.ok:
                 raise RuntimeError(f"Ollama-Fehler {response.status_code}: {response.text}")
             for raw_line in response.iter_lines(decode_unicode=True):
@@ -287,11 +318,11 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
         raise
     except requests.exceptions.ConnectionError as error:
         raise RuntimeError(
-            f"Ollama ist unter {OLLAMA_API} nicht erreichbar. "
+            f"Ollama ist unter {api_url} nicht erreichbar. "
             "Prüfe Docker-Portfreigabe (-p 11434:11434), Ollama-Status und Firewall."
         ) from error
     except requests.exceptions.Timeout as error:
-        raise RuntimeError(f"Timeout beim Zugriff auf Ollama ({OLLAMA_API}).") from error
+        raise RuntimeError(f"Timeout beim Zugriff auf Ollama ({api_url}).") from error
     finally:
         line_logger.flush()
         thinking_logger.flush()
@@ -320,6 +351,90 @@ def call_qwen(image: Image.Image, model: str, context: int, timeout: int, tile_i
     return extract_json(raw_content)
 
 
+def _call_llamacpp(image: Image.Image, model: str, timeout: int, tile_index: int, api_url: str) -> dict[str, Any]:
+    """Spricht die OpenAI-kompatible /v1/chat/completions-API von llama.cpp's
+    eigenem Server an (Fallback, falls Ollama mit diesem selbst konvertierten
+    Qwen3-VL-GGUF+mmproj-Paar abstürzt - siehe finetune/README.md)."""
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": PROMPT},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encode_jpeg(image)}"}},
+            ],
+        }],
+        "stream": True,
+        "temperature": 0,
+        # llama.cpp's eigener Default ist 1.0 (keine Bestrafung), anders als
+        # Ollamas Modelfile-Default; ohne das kann greedy Decoding (temperature
+        # 0) sich in kurzen Wiederholungsschleifen festfahren (siehe
+        # RepetitionLoopError/_RAW_REPEAT_RE oben).
+        "repeat_penalty": 1.1,
+    }
+    LOG.info(
+        "llama.cpp-Anfrage für Abschnitt %d: URL=%s, Modell=%s, Bild=%dx%d",
+        tile_index,
+        api_url,
+        model,
+        image.width,
+        image.height,
+    )
+
+    started = time.monotonic()
+    fragments: list[str] = []
+    line_logger = OllamaLineLogger("LLAMACPP")
+    first_fragment_seen = False
+
+    try:
+        with requests.post(api_url, json=payload, stream=True, timeout=(30, timeout)) as response:
+            if not response.ok:
+                raise RuntimeError(f"llama.cpp-Fehler {response.status_code}: {response.text}")
+            # llama.cpp deklariert im Content-Type keinen Charset; ohne diese
+            # Zeile nimmt requests nach RFC 2616 ISO-8859-1 an und zerlegt
+            # UTF-8-Mehrbyte-Zeichen (z.B. "€") in Mojibake ("â¬").
+            response.encoding = "utf-8"
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line or not raw_line.startswith("data:"):
+                    continue
+                data = raw_line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError as error:
+                    raise RuntimeError("llama.cpp lieferte ungültiges Streaming-JSON.") from error
+                if "error" in event:
+                    raise RuntimeError(f"llama.cpp-Fehler: {event['error']}")
+                choices = event.get("choices") or []
+                delta = choices[0].get("delta", {}) if choices else {}
+                fragment = str(delta.get("content") or "")
+                if fragment:
+                    if not first_fragment_seen:
+                        LOG.info("Erstes Antwortfragment nach %.2f s empfangen", time.monotonic() - started)
+                        first_fragment_seen = True
+                    fragments.append(fragment)
+                    line_logger.feed(fragment)
+    except RepetitionLoopError:
+        LOG.warning("llama.cpp-Backend unterstützt kein erzwungenes Entladen; Verbindung wird geschlossen.")
+        raise
+    except requests.exceptions.ConnectionError as error:
+        raise RuntimeError(
+            f"llama.cpp-Server ist unter {api_url} nicht erreichbar. "
+            "Prüfe Docker-Portfreigabe (-p 8080:8080) und Container-Status."
+        ) from error
+    except requests.exceptions.Timeout as error:
+        raise RuntimeError(f"Timeout beim Zugriff auf den llama.cpp-Server ({api_url}).") from error
+    finally:
+        line_logger.flush()
+
+    raw_content = "".join(fragments)
+    if not raw_content:
+        raise RuntimeError("llama.cpp hat keine Textantwort geliefert.")
+    LOG.info("llama.cpp-Antwort für Abschnitt %d abgeschlossen: %.2f s", tile_index, time.monotonic() - started)
+    return extract_json(raw_content)
+
+
 def local_bbox_to_pixels(local_bbox: list[int], width: int, height: int) -> list[int]:
     """Rechnet eine 0-1000-normalisierte Box in Originalpixel der Kachel um."""
     x1, y1, x2, y2 = local_bbox
@@ -335,7 +450,7 @@ def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
     """Fragt Qwen für eine Kachel ab und liefert deren Zeilen in kachellokalen Pixelkoordinaten."""
     prepared = scale_for_model(tile.image, args.max_side, args.upscale)
     LOG.info("Abschnitt %d: Bereich %s, Modellbild %d x %d", tile.index, tile.box, prepared.width, prepared.height)
-    result = call_qwen(prepared, args.model, args.ctx, args.timeout, tile.index)
+    result = call_qwen(prepared, args.model, args.ctx, args.timeout, tile.index, args.backend, args.api_url)
     raw_lines = result.get("lines", [])
     if not isinstance(raw_lines, list):
         raise ValueError('Antwort enthält keine Liste "lines".')
@@ -356,12 +471,17 @@ def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
         confidence = str(raw_line.get("confidence", "low")).lower().strip()
         if confidence not in {"high", "medium", "low"}:
             confidence = "low"
+        try:
+            angle = float(raw_line.get("angle", 0))
+        except (TypeError, ValueError):
+            angle = 0.0
         lines.append({
             "id": "",
             "bbox_pixels": local_bbox_to_pixels(local_bbox, tile_width, tile_height),
             "bbox_1000": local_bbox,
             "text": text,
             "confidence": confidence,
+            "angle": angle,
         })
     LOG.info("Abschnitt %d: %d gültige Zeilen übernommen", tile.index, len(lines))
     return lines
@@ -377,15 +497,17 @@ def finalize_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def maybe_adjust_with_tesseract(
     args: argparse.Namespace, image_path: Path, lines: list[dict[str, Any]], width: int, height: int
 ) -> list[dict[str, Any]]:
-    """Wendet bei --tesseract-adjust zusätzlich Snap+Fill an (siehe
-    tesseract_boxes.py). Ein nicht erreichbarer Dienst oder sonstiger Fehler
-    wird nur protokolliert - er darf den sonst erfolgreichen Qwen-Lauf nicht
-    abbrechen."""
+    """Wendet bei --tesseract-adjust zusätzlich Snap an (siehe
+    tesseract_boxes.py): vorhandene Zeilen werden auf die am besten
+    überlappende Tesseract-Box eingerastet, es werden aber keine neuen
+    Zeilen aus unzugeordneten Tesseract-Boxen ergänzt. Ein nicht
+    erreichbarer Dienst oder sonstiger Fehler wird nur protokolliert - er
+    darf den sonst erfolgreichen Qwen-Lauf nicht abbrechen."""
     if not args.tesseract_adjust:
         return lines
     try:
         new_lines, status = tesseract_boxes.detect_and_adjust(
-            image_path, lines, width, height, lang=args.tesseract_lang, psm=args.tesseract_psm
+            image_path, lines, width, height, lang=args.tesseract_lang, psm=args.tesseract_psm, add_unmatched=False
         )
     except Exception as error:
         LOG.warning("Tesseract-Anpassung übersprungen: %s", error)
@@ -403,7 +525,8 @@ def build_processing_block(args: argparse.Namespace, log_file: Path, tile_count:
         "tile_size": args.tile_size,
         "tile_overlap": args.overlap,
         "tile_count": tile_count,
-        "ollama_api": OLLAMA_API,
+        "backend": args.backend,
+        "api_url": args.api_url,
         "streaming": True,
         "log_file": str(log_file),
     }
@@ -512,7 +635,7 @@ def process_page(args: argparse.Namespace, source: Path) -> list[Path]:
 
     configure_logging(log_file, args.verbose)
     LOG.info("Start: %s", source)
-    LOG.info("Ollama API: %s", OLLAMA_API)
+    LOG.info("Backend: %s, API: %s", args.backend, args.api_url)
     LOG.info("Bild: %d x %d Pixel", page_width, page_height)
     LOG.info("Verarbeitung in %d Abschnitt(en)", len(tiles))
 
@@ -656,6 +779,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama-Modell; Standard: {DEFAULT_MODEL}")
     parser.add_argument("--ctx", type=positive_int, default=DEFAULT_CONTEXT, help=f"Ollama-Kontextgröße; Standard: {DEFAULT_CONTEXT}")
+    parser.add_argument(
+        "--backend",
+        choices=("ollama", "llamacpp"),
+        default=DEFAULT_BACKEND,
+        help="Inferenz-Backend; Standard: ollama. 'llamacpp' spricht stattdessen den "
+        "OpenAI-kompatiblen llama.cpp-Server an (siehe finetune/README.md, Fallback "
+        "falls Ollama mit einem selbst konvertierten Qwen3-VL-GGUF+mmproj-Paar abstürzt).",
+    )
+    parser.add_argument(
+        "--api-url",
+        default=None,
+        help=f"API-URL; Standard je Backend: ollama={OLLAMA_API}, llamacpp={LLAMACPP_API}",
+    )
     parser.add_argument("--max-side", type=positive_int, default=DEFAULT_MAX_SIDE, help=f"Maximale Seitenlänge je Modellbild; Standard: {DEFAULT_MAX_SIDE}")
     parser.add_argument(
         "--tile-trigger",
@@ -682,7 +818,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--tesseract-adjust",
         action="store_true",
         help="Nach jeder Qwen-Erkennung zusätzlich Tesseract-Boxen abrufen und die "
-        "Zeilenboxen per Snap+Fill anpassen (siehe tesseract_boxes.py); erfordert den "
+        "vorhandenen Zeilenboxen per Snap einrasten (siehe tesseract_boxes.py); es werden "
+        "keine neuen Zeilen aus unzugeordneten Tesseract-Boxen ergänzt. Erfordert den "
         "laufenden Tesseract-Docker-Dienst (docker/tesseract-ocr/). Ein nicht erreichbarer "
         "Dienst wird nur protokolliert, nicht als Fehler behandelt.",
     )
@@ -703,6 +840,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    if args.api_url is None:
+        args.api_url = LLAMACPP_API if args.backend == "llamacpp" else OLLAMA_API
     if args.max_side < 512 or args.tile_size < 512 or args.tile_trigger < 512:
         raise SystemExit("max-side, tile-size und tile-trigger müssen mindestens 512 sein.")
     try:
