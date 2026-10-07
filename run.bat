@@ -89,6 +89,8 @@ if "%INPUT_PATH%"=="" (
 )
 echo.
 echo Optionale zusaetzliche Argumente, z.B. --model qwen3-vl:4b --verbose
+echo Groesseres Modell (12 GB VRAM + 32 GB RAM, langsamer, genauer^):
+echo   --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288
 echo (Liste aller Optionen: qwen_preannotate.py --help^). Leer lassen fuer Standard.
 set "EXTRA_ARGS="
 set /p EXTRA_ARGS="Zusaetzliche Optionen: "

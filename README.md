@@ -40,6 +40,56 @@ ollama list
 
 Den exakten Namen aus `ollama list` in der Oberfläche eintragen.
 
+## Größere Modelle als der Grafikspeicher (CPU-Auslagerung)
+
+Ein Modell, das nicht vollständig in den VRAM passt (z.B. 12 GB Grafikkarte), kann
+trotzdem genutzt werden: Ollama legt so viele Schichten wie möglich auf die GPU und
+lässt den Rest auf der CPU im Arbeitsspeicher laufen. Das ist langsamer, liefert aber
+spürbar bessere Erkennung. Empfehlung für 12 GB VRAM + 32 GB RAM:
+
+| Modell | Größe (Q4_K_M) | Hinweis |
+|---|---|---|
+| `qwen3-vl:30b-a3b-instruct` | 20 GB | **Empfohlen.** MoE: nur ~3B aktive Parameter je Token, daher trotz Auslagerung brauchbar schnell |
+| `qwen3-vl:32b-instruct` | 21 GB | Dicht (alle 32B je Token) - deutlich langsamer, ggf. etwas genauer |
+
+Immer die `-instruct`-Variante nehmen; `-thinking` erzeugt lange Denktexte vor der
+Antwort. Die Vorannotation schaltet den Denkmodus ohnehin ab (`--think` schaltet ihn ein).
+
+```powershell
+ollama pull qwen3-vl:30b-a3b-instruct
+python qwen_preannotate.py C:\Scans --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288
+```
+
+- `--max-side 1536`: größere Modelle profitieren stärker von mehr Auflösung der Handschrift.
+- `--ctx 12288`: bei 1536 px reicht 8192 für volle Seiten oft nicht mehr; das Log warnt,
+  wenn der Kontext fast ausgeschöpft ist oder die Antwort abgeschnitten wurde.
+- Das Log zeigt nach dem ersten Abschnitt die GPU/CPU-Aufteilung (wie `ollama ps`) und
+  die Generierungsgeschwindigkeit in Tokens/s.
+
+**Ollama-Einstellungen** (sparen VRAM für den KV-Cache, damit mehr Modellschichten auf
+die GPU passen). Ollama nativ unter Windows - danach Ollama neu starten:
+
+```powershell
+setx OLLAMA_FLASH_ATTENTION 1
+setx OLLAMA_KV_CACHE_TYPE q8_0
+```
+
+Ollama in Docker: `-e OLLAMA_FLASH_ATTENTION=1 -e OLLAMA_KV_CACHE_TYPE=q8_0` beim
+`docker run` ergänzen (bzw. unter `environment:` in der Compose-Datei).
+
+**Wichtig bei Docker Desktop (WSL2):** Die Docker-VM erhält standardmäßig nur die
+Hälfte des Arbeitsspeichers (bei 32 GB also 16 GB) - zu wenig für ein 20-GB-Modell.
+In `%UserProfile%\.wslconfig` anheben und danach `wsl --shutdown` ausführen:
+
+```ini
+[wsl2]
+memory=26GB
+```
+
+Andere Programme während des Laufs möglichst schließen. Ob sich das größere Modell
+lohnt, am besten an einigen bereits korrigierten Seiten (`*_annotation.json`) mit
+`--force` in einem Kopie-Ordner vergleichen.
+
 ## Start
 
 ```powershell

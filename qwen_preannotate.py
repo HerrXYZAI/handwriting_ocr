@@ -241,16 +241,83 @@ def stop_ollama_model(model: str) -> None:
         LOG.warning("Ollama-Modell '%s' konnte nicht über die API gestoppt werden: %s", model, error)
 
 
+_PLACEMENT_LOGGED: set[str] = set()
+
+
+def log_ollama_placement(model: str, api_url: str) -> None:
+    """Protokolliert einmal je Modell, welcher Anteil im VRAM liegt (wie `ollama ps`).
+
+    Passt ein großes Modell (z.B. qwen3-vl:30b-a3b-instruct) nicht vollständig in
+    den Grafikspeicher, lagert Ollama die übrigen Schichten automatisch in den
+    Arbeitsspeicher aus. Diese Aufteilung bestimmt maßgeblich die Laufzeit."""
+    if model in _PLACEMENT_LOGGED:
+        return
+    _PLACEMENT_LOGGED.add(model)
+    ps_api = api_url.rsplit("/", 1)[0] + "/ps"
+    try:
+        response = requests.get(ps_api, timeout=10)
+        response.raise_for_status()
+        entries = response.json().get("models", [])
+    except Exception as error:
+        LOG.debug("Modellaufteilung konnte nicht abgefragt werden (%s): %s", ps_api, error)
+        return
+    for entry in entries:
+        if entry.get("name") != model and entry.get("model") != model:
+            continue
+        size = int(entry.get("size") or 0)
+        size_vram = int(entry.get("size_vram") or 0)
+        if size <= 0:
+            return
+        gpu_share = size_vram / size * 100
+        LOG.info(
+            "Modellaufteilung '%s': %.1f GB gesamt, %.1f GB im VRAM (%.0f%% GPU / %.0f%% CPU)",
+            model,
+            size / 1e9,
+            size_vram / 1e9,
+            gpu_share,
+            100 - gpu_share,
+        )
+        if gpu_share < 99.5:
+            LOG.info(
+                "Modell läuft teilweise auf der CPU (Auslagerung in den Arbeitsspeicher) - "
+                "langsamer, aber funktionsfähig."
+            )
+        return
+
+
 def call_qwen(
-    image: Image.Image, model: str, context: int, timeout: int, tile_index: int, backend: str, api_url: str
+    image: Image.Image,
+    model: str,
+    context: int,
+    timeout: int,
+    tile_index: int,
+    backend: str,
+    api_url: str,
+    think: bool = False,
 ) -> dict[str, Any]:
     if backend == "llamacpp":
-        return _call_llamacpp(image, model, timeout, tile_index, api_url)
-    return _call_ollama(image, model, context, timeout, tile_index, api_url)
+        return _call_llamacpp(image, model, timeout, tile_index, api_url, think)
+    return _call_ollama(image, model, context, timeout, tile_index, api_url, think)
+
+
+def _post_ollama_stream(api_url: str, payload: dict[str, Any], timeout: int) -> requests.Response:
+    """Sendet die Anfrage; lehnt eine ältere Ollama-Version oder ein Modell den
+    Parameter "think" ab, wird einmal ohne ihn wiederholt."""
+    response = requests.post(api_url, json=payload, stream=True, timeout=(30, timeout))
+    if not response.ok and "think" in payload and "think" in response.text.lower():
+        LOG.warning(
+            "Ollama akzeptiert den Parameter 'think' für dieses Modell nicht (%s); "
+            "Anfrage wird ohne ihn wiederholt.",
+            response.text.strip()[:200],
+        )
+        response.close()
+        retry_payload = {key: value for key, value in payload.items() if key != "think"}
+        response = requests.post(api_url, json=retry_payload, stream=True, timeout=(30, timeout))
+    return response
 
 
 def _call_ollama(
-    image: Image.Image, model: str, context: int, timeout: int, tile_index: int, api_url: str
+    image: Image.Image, model: str, context: int, timeout: int, tile_index: int, api_url: str, think: bool = False
 ) -> dict[str, Any]:
     payload = {
         "model": model,
@@ -261,16 +328,22 @@ def _call_ollama(
         }],
         "stream": True,
         "format": "json",
+        # Thinking-Modelle (z.B. qwen3-vl:*-thinking) erzeugen sonst vor der
+        # eigentlichen Antwort lange Denktexte. Das kostet bei großen, teilweise
+        # auf die CPU ausgelagerten Modellen viel Zeit und füllt den Kontext, bevor
+        # das JSON überhaupt beginnt. Für reine Instruct-Modelle ohne Wirkung.
+        "think": bool(think),
         "options": {"temperature": 0, "num_ctx": context},
     }
     LOG.info(
-        "Ollama-Anfrage für Abschnitt %d: URL=%s, Modell=%s, Kontext=%d, Bild=%dx%d",
+        "Ollama-Anfrage für Abschnitt %d: URL=%s, Modell=%s, Kontext=%d, Bild=%dx%d, Denken=%s",
         tile_index,
         api_url,
         model,
         context,
         image.width,
         image.height,
+        "an" if think else "aus",
     )
 
     started = time.monotonic()
@@ -283,7 +356,7 @@ def _call_ollama(
     first_thinking_seen = False
 
     try:
-        with requests.post(api_url, json=payload, stream=True, timeout=(30, timeout)) as response:
+        with _post_ollama_stream(api_url, payload, timeout) as response:
             if not response.ok:
                 raise RuntimeError(f"Ollama-Fehler {response.status_code}: {response.text}")
             for raw_line in response.iter_lines(decode_unicode=True):
@@ -312,6 +385,11 @@ def _call_ollama(
                     thinking_logger.feed(thinking)
                 if event.get("done"):
                     final_message = event
+                    if event.get("done_reason") == "length":
+                        LOG.warning(
+                            "Antwort wurde wegen Kontext-/Längenlimit abgeschnitten (done_reason=length). "
+                            "--ctx erhöhen oder --max-side verringern."
+                        )
                     break
     except RepetitionLoopError:
         stop_ollama_model(model)
@@ -342,6 +420,20 @@ def _call_ollama(
             "und ggf. empfangene Denkfragmente)."
         )
     LOG.info("Ollama-Antwort für Abschnitt %d abgeschlossen: %.2f s", tile_index, time.monotonic() - started)
+    log_ollama_placement(model, api_url)
+    prompt_tokens = final_message.get("prompt_eval_count")
+    output_tokens = final_message.get("eval_count")
+    if isinstance(prompt_tokens, int) and isinstance(output_tokens, int) and prompt_tokens + output_tokens > 0.9 * context:
+        LOG.warning(
+            "Kontext fast ausgeschöpft: %d Eingabe- + %d Ausgabetokens bei --ctx %d. "
+            "Ausgabe könnte abgeschnitten sein; --ctx erhöhen.",
+            prompt_tokens,
+            output_tokens,
+            context,
+        )
+    eval_duration = final_message.get("eval_duration")
+    if isinstance(output_tokens, int) and isinstance(eval_duration, (int, float)) and eval_duration > 0:
+        LOG.info("Generierungsgeschwindigkeit: %.2f Tokens/s", output_tokens / (eval_duration / 1e9))
     for key in ("prompt_eval_count", "eval_count"):
         if key in final_message:
             LOG.info("Ollama-Metrik %s: %s", key, final_message[key])
@@ -351,7 +443,9 @@ def _call_ollama(
     return extract_json(raw_content)
 
 
-def _call_llamacpp(image: Image.Image, model: str, timeout: int, tile_index: int, api_url: str) -> dict[str, Any]:
+def _call_llamacpp(
+    image: Image.Image, model: str, timeout: int, tile_index: int, api_url: str, think: bool = False
+) -> dict[str, Any]:
     """Spricht die OpenAI-kompatible /v1/chat/completions-API von llama.cpp's
     eigenem Server an (Fallback, falls Ollama mit diesem selbst konvertierten
     Qwen3-VL-GGUF+mmproj-Paar abstürzt - siehe finetune/README.md)."""
@@ -371,6 +465,8 @@ def _call_llamacpp(image: Image.Image, model: str, timeout: int, tile_index: int
         # 0) sich in kurzen Wiederholungsschleifen festfahren (siehe
         # RepetitionLoopError/_RAW_REPEAT_RE oben).
         "repeat_penalty": 1.1,
+        # Entspricht "think" bei Ollama; von Templates ohne Thinking ignoriert.
+        "chat_template_kwargs": {"enable_thinking": bool(think)},
     }
     LOG.info(
         "llama.cpp-Anfrage für Abschnitt %d: URL=%s, Modell=%s, Bild=%dx%d",
@@ -450,7 +546,9 @@ def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
     """Fragt Qwen für eine Kachel ab und liefert deren Zeilen in kachellokalen Pixelkoordinaten."""
     prepared = scale_for_model(tile.image, args.max_side, args.upscale)
     LOG.info("Abschnitt %d: Bereich %s, Modellbild %d x %d", tile.index, tile.box, prepared.width, prepared.height)
-    result = call_qwen(prepared, args.model, args.ctx, args.timeout, tile.index, args.backend, args.api_url)
+    result = call_qwen(
+        prepared, args.model, args.ctx, args.timeout, tile.index, args.backend, args.api_url, args.think
+    )
     raw_lines = result.get("lines", [])
     if not isinstance(raw_lines, list):
         raise ValueError('Antwort enthält keine Liste "lines".')
@@ -520,6 +618,7 @@ def build_processing_block(args: argparse.Namespace, log_file: Path, tile_count:
     return {
         "model": args.model,
         "context_size": args.ctx,
+        "think": args.think,
         "max_model_image_side": args.max_side,
         "tile_trigger": args.tile_trigger,
         "tile_size": args.tile_size,
@@ -778,7 +877,20 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Rasterauflösung für PDF-Seiten in DPI; Standard: {pdf_utils.DEFAULT_PDF_DPI}",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Ollama-Modell; Standard: {DEFAULT_MODEL}")
-    parser.add_argument("--ctx", type=positive_int, default=DEFAULT_CONTEXT, help=f"Ollama-Kontextgröße; Standard: {DEFAULT_CONTEXT}")
+    parser.add_argument(
+        "--ctx",
+        type=positive_int,
+        default=DEFAULT_CONTEXT,
+        help=f"Ollama-Kontextgröße; Standard: {DEFAULT_CONTEXT}. Bei --max-side 1536 und "
+        "vollen Seiten ggf. 12288.",
+    )
+    parser.add_argument(
+        "--think",
+        action="store_true",
+        help="Denkmodus (thinking) des Modells zulassen. Standard: aus - spart bei großen, "
+        "teilweise auf die CPU ausgelagerten Modellen viel Zeit und verhindert, dass "
+        "Denktext den Kontext füllt, bevor das JSON beginnt.",
+    )
     parser.add_argument(
         "--backend",
         choices=("ollama", "llamacpp"),

@@ -32,6 +32,9 @@ OLLAMA_TAGS_API = f"{OLLAMA_HOST}/api/tags"
 BACKEND = os.environ.get("OCR_BACKEND", "ollama").strip().lower()
 LLAMACPP_API = os.environ.get("LLAMACPP_API", "http://127.0.0.1:8080/v1/chat/completions")
 DEFAULT_MODEL = "qwen3-vl:4b"
+# Gesamt-Timeout je Vorannotation in Sekunden (ohne Streaming); großzügig für
+# große Modelle mit CPU-Auslagerung. Per Umgebungsvariable anpassbar.
+OLLAMA_TIMEOUT = int(os.environ.get("QWEN_TIMEOUT", "7200"))
 DEFAULT_CONTEXT_SIZE = 4096
 DEFAULT_DATASET_ROOT = r"C:\test\handwriting_ocr\pictures_for_OCR"
 CONFIDENCE_VALUES = {"high", "medium", "low"}
@@ -317,9 +320,19 @@ def _run_qwen_ollama(path: Path, model: str, context_size: int) -> str:
         }],
         "stream": False,
         "format": "json",
+        # Denkmodus aus: spart bei großen (teilweise auf die CPU ausgelagerten)
+        # Modellen viel Zeit; für reine Instruct-Modelle ohne Wirkung.
+        "think": False,
         "options": {"temperature": 0, "num_ctx": int(context_size)},
     }
-    response = requests.post(OLLAMA_API, json=payload, timeout=1800)
+    # Großzügiges Timeout: Ohne Streaming muss die gesamte Antwort innerhalb
+    # dieser Zeit fertig sein - bei großen Modellen mit CPU-Auslagerung
+    # (z.B. qwen3-vl:30b-a3b-instruct auf 12 GB VRAM) kann das dauern.
+    response = requests.post(OLLAMA_API, json=payload, timeout=OLLAMA_TIMEOUT)
+    if not response.ok and "think" in response.text.lower():
+        # Ältere Ollama-Version oder Modell ohne Thinking-Unterstützung.
+        payload.pop("think")
+        response = requests.post(OLLAMA_API, json=payload, timeout=OLLAMA_TIMEOUT)
     if not response.ok:
         raise RuntimeError(f"Ollama-Fehler {response.status_code}: {response.text}")
     raw = response.json().get("message", {}).get("content", "")
@@ -352,8 +365,9 @@ def _run_qwen_llamacpp(path: Path) -> str:
         # Ollamas Modelfile-Default; ohne das kann greedy Decoding (temperature
         # 0) sich in kurzen Wiederholungsschleifen festfahren.
         "repeat_penalty": 1.1,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
-    response = requests.post(LLAMACPP_API, json=payload, timeout=1800)
+    response = requests.post(LLAMACPP_API, json=payload, timeout=OLLAMA_TIMEOUT)
     if not response.ok:
         raise RuntimeError(f"llama.cpp-Fehler {response.status_code}: {response.text}")
     choices = response.json().get("choices") or []
