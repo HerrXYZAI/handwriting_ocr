@@ -52,26 +52,28 @@ echo ===================================================
 echo  1. Annotations-GUI starten
 echo  2. Vorannotation (qwen_preannotate.py)
 echo  3. Annotation validieren (validate_annotations.py)
-echo  4. Tesseract-Dienst starten (Docker, fuer Box-Anpassung)
-echo  5. Trainings-Datensatz exportieren (qwen_export_dataset.py)
-echo  6. Finetuning starten (Docker, in finetune\)
-echo  7. Adapter mit Basismodell zusammenfuehren (Docker, finetune\merge.sh)
-echo  8. Zurueck nach Ollama (GGUF konvertieren, quantisieren, importieren)
-echo  9. Beenden
+echo  4. Modellvergleich auf geprueften Seiten (model_compare.py)
+echo  5. Tesseract-Dienst starten (Docker, fuer Box-Anpassung)
+echo  6. Trainings-Datensatz exportieren (qwen_export_dataset.py)
+echo  7. Finetuning starten (Docker, in finetune\)
+echo  8. Adapter mit Basismodell zusammenfuehren (Docker, finetune\merge.sh)
+echo  9. Zurueck nach Ollama (GGUF konvertieren, quantisieren, importieren)
+echo 10. Beenden
 echo ===================================================
 set "CHOICE="
-set /p CHOICE="Auswahl (1-9, Enter = 1): "
+set /p CHOICE="Auswahl (1-10, Enter = 1): "
 if "%CHOICE%"=="" set "CHOICE=1"
 
 if "%CHOICE%"=="1" goto :gui
 if "%CHOICE%"=="2" goto :preannotate
 if "%CHOICE%"=="3" goto :validate
-if "%CHOICE%"=="4" goto :tesseract
-if "%CHOICE%"=="5" goto :export
-if "%CHOICE%"=="6" goto :finetune
-if "%CHOICE%"=="7" goto :merge_adapter
-if "%CHOICE%"=="8" goto :to_ollama
-if "%CHOICE%"=="9" goto :eof
+if "%CHOICE%"=="4" goto :compare
+if "%CHOICE%"=="5" goto :tesseract
+if "%CHOICE%"=="6" goto :export
+if "%CHOICE%"=="7" goto :finetune
+if "%CHOICE%"=="8" goto :merge_adapter
+if "%CHOICE%"=="9" goto :to_ollama
+if "%CHOICE%"=="10" goto :eof
 goto :menu
 
 :gui
@@ -130,6 +132,31 @@ echo (Liste aller Optionen: validate_annotations.py --help^). Leer lassen fuer S
 set "VALIDATE_ARGS="
 set /p VALIDATE_ARGS="Zusaetzliche Optionen: "
 "%PYEXE%" validate_annotations.py "%ANNOTATION_FILE%" %VALIDATE_ARGS%
+goto :done
+
+:compare
+echo.
+echo Fuehrt ein Modell auf allen geprueften Seiten (*_annotation.json) aus und
+echo speichert das Ergebnis dort unter model_runs; danach Vergleichstabelle.
+echo Ansicht im Detail: GUI, Reiter "Modellvergleich". Seiten mit vorhandenem
+echo Lauf werden uebersprungen (Abbruch mit Strg+C jederzeit moeglich).
+set "COMPARE_ROOT="
+set /p COMPARE_ROOT="Dataset-Ordner: "
+if "%COMPARE_ROOT%"=="" (
+  echo Kein Ordner angegeben.
+  goto :done
+)
+set "COMPARE_MODEL="
+set /p COMPARE_MODEL="Modell (Enter = nur Vergleichstabelle anzeigen): "
+if "%COMPARE_MODEL%"=="" (
+  "%PYEXE%" model_compare.py report "%COMPARE_ROOT%"
+  goto :done
+)
+echo.
+echo Optionale Argumente, z.B. --max-side 1536 --ctx 12288 --label qwen3-vl:4b@1536 --limit 5
+set "COMPARE_ARGS="
+set /p COMPARE_ARGS="Zusaetzliche Optionen: "
+"%PYEXE%" model_compare.py run "%COMPARE_ROOT%" --model %COMPARE_MODEL% %COMPARE_ARGS%
 goto :done
 
 :tesseract

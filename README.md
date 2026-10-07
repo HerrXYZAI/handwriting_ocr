@@ -87,8 +87,62 @@ memory=26GB
 ```
 
 Andere Programme während des Laufs möglichst schließen. Ob sich das größere Modell
-lohnt, am besten an einigen bereits korrigierten Seiten (`*_annotation.json`) mit
-`--force` in einem Kopie-Ordner vergleichen.
+lohnt, zeigt der Modellvergleich (nächster Abschnitt).
+
+## Modellvergleich auf geprüften Seiten
+
+Vergleicht Modelle (oder dasselbe Modell mit anderen Einstellungen) an Seiten, die bereits
+von Hand geprüft und als `*_annotation.json` gespeichert wurden. Es muss nichts kopiert
+werden: Jeder Modelllauf wird **in der geprüften Datei selbst** unter `model_runs`
+gespeichert, die geprüften Zeilen (`lines`) bleiben unverändert und dienen als Referenz.
+Export, Training und Validierung ignorieren `model_runs`.
+
+```json
+"model_runs": {
+  "qwen3-vl:4b":               {"model": "...", "duration_s": 95.2, "settings": {...}, "lines": [...]},
+  "qwen3-vl:30b-a3b-instruct": {"model": "...", "duration_s": 1310.4, "settings": {...}, "lines": [...]}
+}
+```
+
+Der Schlüssel ist ein frei wählbares Label (Standard: Modellname), damit sich auch
+z.B. `qwen3-vl:4b` und `qwen3-vl:4b@1536` (gleiches Modell, andere `--max-side`)
+vergleichen lassen. Für einen fairen Vergleich **beide** Modelle neu laufen lassen: Der
+beim Annotieren gespeicherte Vorannotations-Text (`text_predicted`) hat keine
+Original-Boxen mehr und wurde evtl. mit anderen Einstellungen erzeugt. Die Läufe
+verwenden denselben Ablauf und Prompt wie `qwen_preannotate.py`, jedoch ohne Kacheln,
+damit das Modell genau das geprüfte Bild sieht.
+
+**Kennzahlen** (über alle Seiten aufsummiert, nicht je Seite gemittelt):
+
+- **CER/WER Seite**: Zeichen-/Wortfehlerrate über den gesamten Seitentext in
+  Leserichtung - unabhängig davon, wie das Modell Zeilen in Boxen aufteilt. Die
+  Hauptkennzahl für die Texterkennung. `[?]`-Marker werden vorher entfernt.
+- **Zeilen-Recall / -Precision / F1, Ø IoU**: Referenz- und Modellboxen werden 1:1 über
+  ihre Überlappung (IoU ≥ Schwelle, Standard 0,3) zugeordnet. Recall = Anteil gefundener
+  Referenzzeilen, Precision = Anteil Modellzeilen mit passender Referenz (z.B. kein
+  erfundener Stempeltext), Ø IoU = wie genau die Boxen sitzen.
+- **CER Zeilen**: Fehlerrate nur über die zugeordneten Zeilenpaare.
+- **Ø Zeit/Seite**: gemessene Laufzeit, wichtig für große, ausgelagerte Modelle.
+
+**In der Oberfläche** (Reiter *Modellvergleich*): Modell auf der gewählten Seite oder
+auf allen geprüften Seiten ohne diesen Lauf ausführen, Übersichtstabelle berechnen und
+eine Seite im Detail ansehen: zwei Läufe nebeneinander mit Referenzboxen (grün) und
+Modellboxen (gestrichelt; rot "+" = Zeile ohne Referenz) sowie ein zeilenweiser
+Text-Diff (rot = fehlt/falsch, grün = stattdessen vom Modell geschrieben).
+
+**Kommandozeile** (empfohlen für lange Stapelläufe mit großen Modellen, auch über
+`run.bat`, Punkt 4). Seiten mit vorhandenem Lauf werden übersprungen, ein Abbruch mit
+Strg+C verliert keine fertigen Seiten:
+
+```powershell
+python model_compare.py run C:\Handschrift-Dataset --model qwen3-vl:4b
+python model_compare.py run C:\Handschrift-Dataset --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288
+python model_compare.py report C:\Handschrift-Dataset
+```
+
+Mit `--limit 5` erst einmal nur fünf Seiten testen. Wird eine Seite später im
+Annotations-Reiter um 90° gedreht und gespeichert, werden ihre Läufe verworfen (die
+Boxen passen nicht mehr); Textkorrekturen und Speichern lassen die Läufe dagegen stehen.
 
 ## Start
 

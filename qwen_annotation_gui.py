@@ -18,6 +18,7 @@ import gradio as gr
 import requests
 from PIL import Image, ImageOps
 
+import model_compare
 import pdf_utils
 import tesseract_boxes
 import tiling
@@ -1695,9 +1696,21 @@ def save_annotation(table: Any, annotation: dict[str, Any], image_path: str, mod
 
         annotation = add_metadata(annotation, image_path, model)
         output = Path(image_path).with_name(Path(image_path).stem + "_annotation.json")
+        # Modellvergleichsläufe (Reiter "Modellvergleich") werden nur direkt in
+        # der Datei gepflegt; die Version auf der Platte ist maßgeblich, damit
+        # ein zwischenzeitlich (z.B. per model_compare.py) ergänzter Lauf nicht
+        # mit dem älteren Stand aus der geöffneten Annotation überschrieben wird.
+        # Nach einer Seitendrehung passen ihre Boxen nicht mehr -> verwerfen.
+        disk_runs = model_compare.runs_on_disk(output)
+        annotation.pop(model_compare.RUNS_KEY, None)
+        runs_note = ""
+        if pending_rotation and disk_runs:
+            runs_note = " Modellvergleichsläufe dieser Seite verworfen (Boxen passen nach der Drehung nicht mehr)."
+        elif disk_runs:
+            annotation[model_compare.RUNS_KEY] = disk_runs
         output.write_text(json.dumps(annotation, ensure_ascii=False, indent=2), encoding="utf-8")
         all_html, flagged_html = render_file_lists(dataset_root, image_path)
-        rotation_note = " (Bilddatei physisch gedreht)" if pending_rotation else ""
+        rotation_note = (" (Bilddatei physisch gedreht)" if pending_rotation else "") + runs_note
         return annotation, str(output), f"Annotation gespeichert: {output}{rotation_note}", image_path, all_html, flagged_html
     except Exception as exc:
         raise gr.Error(f"Speichern fehlgeschlagen: {exc}") from exc
@@ -1802,6 +1815,278 @@ def export_jsonl(table: Any, annotation: dict[str, Any], image_path: str, datase
         raise gr.Error(f"JSONL-Export fehlgeschlagen: {exc}") from exc
 
 
+# ---------------------------------------------------------------------------
+# Reiter "Modellvergleich" (Logik in model_compare.py)
+# ---------------------------------------------------------------------------
+
+def _compare_api_url() -> str:
+    return LLAMACPP_API if BACKEND == "llamacpp" else OLLAMA_API
+
+
+def compare_page_choices(root: str) -> list[tuple[str, str]]:
+    choices = []
+    base = Path(root) if root and root.strip() else None
+    for path in model_compare.find_annotation_files(root):
+        try:
+            count = len(model_compare.get_runs(model_compare.load_json(path)))
+        except (OSError, json.JSONDecodeError):
+            continue
+        try:
+            name = path.relative_to(base).as_posix() if base else path.name
+        except ValueError:
+            name = path.name
+        name = name[: -len(model_compare.ANNOTATION_SUFFIX)]
+        choices.append((f"{name}  ({count} {'Lauf' if count == 1 else 'Läufe'})", str(path)))
+    return choices
+
+
+def compare_run_choices(annotation_path: str | None) -> list[str]:
+    if not annotation_path or not Path(annotation_path).is_file():
+        return []
+    return sorted(model_compare.get_runs(model_compare.load_json(annotation_path)))
+
+
+def compare_refresh_pages(root: str, current: str | None):
+    choices = compare_page_choices(root)
+    values = [value for _, value in choices]
+    value = current if current in values else (values[0] if values else None)
+    runs = compare_run_choices(value)
+    return (
+        gr.update(choices=choices, value=value),
+        gr.update(choices=runs, value=runs[0] if runs else None),
+        gr.update(choices=runs, value=runs[1] if len(runs) > 1 else None),
+        f"{len(choices)} geprüfte Seiten gefunden." if choices else
+        "Keine geprüften Seiten (*_annotation.json) unter dem Dataset-Wurzelverzeichnis gefunden.",
+    )
+
+
+def compare_page_changed(annotation_path: str | None, label_a: str | None, label_b: str | None):
+    runs = compare_run_choices(annotation_path)
+    a = label_a if label_a in runs else (runs[0] if runs else None)
+    b = label_b if label_b in runs and label_b != a else next((r for r in runs if r != a), None)
+    return gr.update(choices=runs, value=a), gr.update(choices=runs, value=b)
+
+
+def compare_page(annotation_path: str | None, label_a: str | None, label_b: str | None, threshold: float):
+    if not annotation_path or not Path(annotation_path).is_file():
+        empty = "<div class='mc-empty'>Bitte eine geprüfte Seite auswählen.</div>"
+        return empty, empty, empty, empty
+    path = Path(annotation_path)
+    data = model_compare.load_json(path)
+    runs = model_compare.get_runs(data)
+    image_path = model_compare.image_for_annotation(path, data)
+    threshold = float(threshold or model_compare.DEFAULT_IOU)
+
+    selected = [label for label in (label_a, label_b) if label and label in runs]
+    selected = list(dict.fromkeys(selected))
+    metrics = [(label, model_compare.page_metrics(data, runs[label], threshold)) for label in selected]
+    overlays = []
+    for slot, color in enumerate(model_compare.RUN_COLORS):
+        if slot < len(selected):
+            label = selected[slot]
+            overlays.append(model_compare.overlay_html(image_path, data, runs[label], color, label, threshold))
+        elif slot == 0:
+            overlays.append(model_compare.overlay_html(image_path, data, None, color, "Nur Referenz", threshold))
+        else:
+            overlays.append("")
+    lines_html = model_compare.line_table_html(data, [(label, runs[label]) for label in selected], threshold)
+    return model_compare.page_metrics_html(metrics), overlays[0], overlays[1], lines_html
+
+
+def compare_summary(root: str, threshold: float, only_common: bool):
+    rows, total, compared = model_compare.summarize(root, float(threshold or model_compare.DEFAULT_IOU), bool(only_common))
+    if not rows:
+        note = f"{total} geprüfte Seiten, aber noch keine Modellläufe. Unten ein Modell ausführen."
+    else:
+        note = (
+            f"**{compared} von {total} geprüften Seiten verglichen**"
+            + (" (nur Seiten, auf denen alle Läufe vorhanden sind)." if only_common else ".")
+            + " Sortiert nach CER (Seite); niedriger ist besser."
+        )
+    return model_compare.summary_table(rows), note
+
+
+def _run_label(model: str, label: str | None) -> str:
+    return (label or "").strip() or model.strip()
+
+
+def compare_run_on_page(
+    annotation_path: str | None, model: str, label: str | None, max_side: float, ctx: float, think: bool,
+    label_a: str | None, label_b: str | None, threshold: float,
+):
+    if not annotation_path:
+        raise gr.Error("Bitte zuerst eine geprüfte Seite auswählen.")
+    if not model or not model.strip():
+        raise gr.Error("Bitte ein Modell wählen.")
+    opts = model_compare.run_options(model, int(max_side), int(ctx), bool(think), BACKEND, _compare_api_url(), OLLAMA_TIMEOUT)
+    run_label = _run_label(model, label)
+    try:
+        run = model_compare.run_model_on_annotation(Path(annotation_path), opts, run_label)
+    except requests.ConnectionError as exc:
+        raise gr.Error(f"Modellserver unter {_compare_api_url()} nicht erreichbar.") from exc
+    except Exception as exc:
+        raise gr.Error(f"Modelllauf fehlgeschlagen: {exc}") from exc
+
+    # Neuen Lauf direkt anzeigen: als B, falls A schon belegt ist, sonst als A.
+    if not label_a or label_a == run_label:
+        label_a, label_b = run_label, (label_b if label_b != run_label else None)
+    else:
+        label_b = run_label
+    runs = compare_run_choices(annotation_path)
+    return (
+        gr.update(choices=runs, value=label_a),
+        gr.update(choices=runs, value=label_b),
+        *compare_page(annotation_path, label_a, label_b, threshold),
+        f"Lauf '{run_label}' gespeichert: {len(run['lines'])} Zeilen in "
+        f"{model_compare.fmt_duration(run['duration_s'])}.",
+    )
+
+
+def compare_run_on_all(root: str, model: str, label: str | None, max_side: float, ctx: float, think: bool, force: bool):
+    """Generator: führt das Modell auf allen geprüften Seiten ohne diesen Lauf
+    aus und meldet nach jeder Seite den Fortschritt (Abbrechen jederzeit
+    möglich, fertige Seiten bleiben gespeichert)."""
+    if not model or not model.strip():
+        raise gr.Error("Bitte ein Modell wählen.")
+    opts = model_compare.run_options(model, int(max_side), int(ctx), bool(think), BACKEND, _compare_api_url(), OLLAMA_TIMEOUT)
+    run_label = _run_label(model, label)
+    files = model_compare.find_annotation_files(root)
+    todo = []
+    for path in files:
+        try:
+            if force or run_label not in model_compare.get_runs(model_compare.load_json(path)):
+                todo.append(path)
+        except (OSError, json.JSONDecodeError):
+            continue
+    if not todo:
+        yield f"Alle {len(files)} geprüften Seiten haben bereits einen Lauf '{run_label}'."
+        return
+
+    durations: list[float] = []
+    errors: list[str] = []
+    for index, path in enumerate(todo, 1):
+        eta = ""
+        if durations:
+            eta = f" - Rest ca. {model_compare.fmt_duration(sum(durations) / len(durations) * (len(todo) - index + 1))}"
+        yield f"[{index}/{len(todo)}] '{run_label}' läuft auf {path.name}{eta} …"
+        try:
+            run = model_compare.run_model_on_annotation(path, opts, run_label)
+            durations.append(run["duration_s"])
+        except Exception as exc:  # eine Seite darf den Stapel nicht abbrechen
+            errors.append(f"{path.name}: {exc}")
+    message = f"Fertig: {len(durations)} von {len(todo)} Seiten mit '{run_label}' verarbeitet"
+    if durations:
+        message += f", Ø {model_compare.fmt_duration(sum(durations) / len(durations))} pro Seite"
+    message += "."
+    if errors:
+        message += f"\n{len(errors)} Fehler:\n" + "\n".join(errors[:10])
+    yield message
+
+
+def compare_delete_run(annotation_path: str | None, label: str | None, label_b: str | None, threshold: float):
+    if not annotation_path or not label:
+        raise gr.Error("Bitte Seite und Lauf A wählen.")
+    model_compare.delete_run(Path(annotation_path), label)
+    runs = compare_run_choices(annotation_path)
+    label_a = label_b if label_b in runs else (runs[0] if runs else None)
+    label_b = next((r for r in runs if r != label_a), None)
+    return (
+        gr.update(choices=runs, value=label_a),
+        gr.update(choices=runs, value=label_b),
+        *compare_page(annotation_path, label_a, label_b, threshold),
+        f"Lauf '{label}' von dieser Seite entfernt.",
+    )
+
+
+def build_compare_tab(dataset_root: gr.Textbox):
+    gr.Markdown(
+        "Vergleicht Modelle auf bereits **geprüften** Seiten (`*_annotation.json` unter dem "
+        "Dataset-Wurzelverzeichnis aus dem Reiter *Annotation*). Jeder Modelllauf wird in der "
+        "geprüften Datei unter `model_runs` gespeichert; die geprüften Zeilen bleiben unverändert "
+        "und dienen als Referenz.\n\n"
+        "- **CER/WER Seite**: Zeichen-/Wortfehlerrate über den ganzen Seitentext in Leserichtung - "
+        "unabhängig davon, wie das Modell Zeilen in Boxen aufteilt. Unsicherheitsmarker `[?]` werden ignoriert.\n"
+        "- **Zeilen-Recall/-Precision/F1, Ø IoU**: Boxen werden 1:1 über ihre Überlappung (IoU ≥ Schwelle) "
+        "zugeordnet. Recall = gefundene Referenzzeilen, Precision = Modellzeilen mit passender Referenz.\n"
+        "- **CER Zeilen**: Fehlerrate nur über die zugeordneten Zeilenpaare."
+    )
+    with gr.Row():
+        iou_threshold = gr.Slider(0.1, 0.9, value=model_compare.DEFAULT_IOU, step=0.05, label="IoU-Schwelle für Box-Zuordnung")
+        only_common = gr.Checkbox(value=True, label="Nur Seiten, auf denen alle Läufe vorhanden sind")
+
+    gr.Markdown("### Übersicht über alle geprüften Seiten")
+    summary_button = gr.Button("Übersicht berechnen", variant="primary")
+    summary_note = gr.Markdown()
+    summary_table = gr.Dataframe(headers=model_compare.SUMMARY_HEADERS, interactive=False, wrap=True)
+
+    gr.Markdown("### Einzelne Seite vergleichen")
+    with gr.Row():
+        page = gr.Dropdown(label="Geprüfte Seite", choices=[], scale=4)
+        pages_refresh = gr.Button("🔄 Seitenliste", scale=1, min_width=80)
+    with gr.Row():
+        run_a = gr.Dropdown(label="Lauf A (orange)", choices=[])
+        run_b = gr.Dropdown(label="Lauf B (violett)", choices=[])
+    with gr.Row():
+        compare_button = gr.Button("Vergleichen", variant="primary")
+        delete_button = gr.Button("Lauf A von dieser Seite löschen")
+    page_metrics = gr.HTML()
+    with gr.Row():
+        overlay_a = gr.HTML()
+        overlay_b = gr.HTML()
+    gr.Markdown(
+        "Zeilenvergleich: <del style='background:rgba(218,30,40,.22)'>rot</del> = in der Referenz, aber "
+        "vom Modell nicht/falsch gelesen; <ins style='background:rgba(36,161,72,.25);text-decoration:none'>grün</ins> "
+        "= stattdessen vom Modell geschrieben."
+    )
+    lines_html = gr.HTML()
+
+    with gr.Accordion("Modell ausführen (Ergebnis wird in der geprüften Datei gespeichert)", open=True):
+        gr.Markdown(
+            "Für einen fairen Vergleich **beide** Modelle hier (oder per `model_compare.py run`) mit "
+            "demselben Ablauf laufen lassen - der ursprüngliche Vorannotations-Text in der Datei "
+            "enthält keine Original-Boxen mehr. Für denselben Modellnamen mit anderen Einstellungen "
+            "ein eigenes Label vergeben (z.B. `qwen3-vl:4b@1536`)."
+        )
+        with gr.Row():
+            run_model = gr.Dropdown(label="Modell", choices=model_dropdown_choices(), value=DEFAULT_MODEL, allow_custom_value=True, scale=3)
+            run_label = gr.Textbox(label="Label (optional, Standard: Modellname)", scale=2)
+        with gr.Row():
+            run_max_side = gr.Number(label="Max. Bildseite (px)", value=1024, precision=0)
+            run_ctx = gr.Number(label="Kontextgröße", value=8192, precision=0)
+            run_think = gr.Checkbox(label="Denkmodus (thinking)", value=False)
+            run_force = gr.Checkbox(label="Vorhandene Läufe mit gleichem Label überschreiben (nur 'alle Seiten')", value=False)
+        with gr.Row():
+            run_page_button = gr.Button("Auf dieser Seite ausführen")
+            run_all_button = gr.Button("Auf allen geprüften Seiten ausführen (fehlende)", variant="primary")
+            run_stop_button = gr.Button("Abbrechen")
+        compare_status = gr.Textbox(label="Status", interactive=False, lines=2)
+
+    page_outputs = [page_metrics, overlay_a, overlay_b, lines_html]
+    summary_button.click(compare_summary, [dataset_root, iou_threshold, only_common], [summary_table, summary_note])
+    pages_refresh.click(compare_refresh_pages, [dataset_root, page], [page, run_a, run_b, compare_status])
+    dataset_root.change(compare_refresh_pages, [dataset_root, page], [page, run_a, run_b, compare_status])
+    page.change(compare_page_changed, [page, run_a, run_b], [run_a, run_b]).then(
+        compare_page, [page, run_a, run_b, iou_threshold], page_outputs
+    )
+    compare_button.click(compare_page, [page, run_a, run_b, iou_threshold], page_outputs)
+    iou_threshold.release(compare_page, [page, run_a, run_b, iou_threshold], page_outputs)
+    delete_button.click(
+        compare_delete_run, [page, run_a, run_b, iou_threshold], [run_a, run_b, *page_outputs, compare_status]
+    )
+    run_page_button.click(
+        compare_run_on_page,
+        [page, run_model, run_label, run_max_side, run_ctx, run_think, run_a, run_b, iou_threshold],
+        [run_a, run_b, *page_outputs, compare_status],
+    )
+    run_all_event = run_all_button.click(
+        compare_run_on_all,
+        [dataset_root, run_model, run_label, run_max_side, run_ctx, run_think, run_force],
+        compare_status,
+    )
+    run_stop_button.click(None, None, None, cancels=[run_all_event])
+    return page, run_a, run_b, compare_status
+
+
 def build_interface() -> gr.Blocks:
     with gr.Blocks(title="Qwen Handschrift-Annotation") as app:
         annotation_state = gr.State({})
@@ -1814,88 +2099,91 @@ def build_interface() -> gr.Blocks:
         # "Winkel übernehmen"-Knopf unter jeder Box mit einem Klick auf eine
         # andere Box anwenden.
         last_angle_state = gr.State(0.0)
-        gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; der kleine Griff über einer Box dreht sie frei (z.B. für eine schräg geschriebene Zeile); ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
-        with gr.Accordion("Dateien im Dataset (Bilder & PDFs, inkl. Unterordner) - annotierte/freigegebene Dateien grün", open=True):
+        with gr.Tab("Annotation"):
+            gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; der kleine Griff über einer Box dreht sie frei (z.B. für eine schräg geschriebene Zeile); ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
+            with gr.Accordion("Dateien im Dataset (Bilder & PDFs, inkl. Unterordner) - annotierte/freigegebene Dateien grün", open=True):
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("**Alle Dateien**")
+                        file_list_all_html = gr.HTML(
+                            render_file_list(DEFAULT_DATASET_ROOT, sync_target=FILE_SYNC_ALL),
+                            elem_id="file-list-all-wrap",
+                        )
+                    with gr.Column():
+                        gr.Markdown("**Nur vorannotiert / annotiert**")
+                        file_list_flagged_html = gr.HTML(
+                            render_file_list(DEFAULT_DATASET_ROOT, only_flagged=True, sync_target=FILE_SYNC_FLAGGED),
+                            elem_id="file-list-flagged-wrap",
+                        )
+                file_sync_all = gr.Textbox(elem_id=FILE_SYNC_ALL, visible=True, container=False)
+                file_sync_flagged = gr.Textbox(elem_id=FILE_SYNC_FLAGGED, visible=True, container=False)
+                refresh_files_button = gr.Button("Dateilisten aktualisieren")
             with gr.Row():
-                with gr.Column():
-                    gr.Markdown("**Alle Dateien**")
-                    file_list_all_html = gr.HTML(
-                        render_file_list(DEFAULT_DATASET_ROOT, sync_target=FILE_SYNC_ALL),
-                        elem_id="file-list-all-wrap",
-                    )
-                with gr.Column():
-                    gr.Markdown("**Nur vorannotiert / annotiert**")
-                    file_list_flagged_html = gr.HTML(
-                        render_file_list(DEFAULT_DATASET_ROOT, only_flagged=True, sync_target=FILE_SYNC_FLAGGED),
-                        elem_id="file-list-flagged-wrap",
-                    )
-            file_sync_all = gr.Textbox(elem_id=FILE_SYNC_ALL, visible=True, container=False)
-            file_sync_flagged = gr.Textbox(elem_id=FILE_SYNC_FLAGGED, visible=True, container=False)
-            refresh_files_button = gr.Button("Dateilisten aktualisieren")
-        with gr.Row():
-            with gr.Column(scale=1):
-                # image_mode=None ist noetig, damit Gradio beim Zurueck-Einlesen des
-                # Pfads (preprocess) den Original-Pfad unveraendert durchreicht: mit dem
-                # Default "RGB" schreibt Gradio jedes Bild, das nicht exakt im PIL-Modus
-                # "RGB" vorliegt (z.B. Graustufen- oder Palette-PNGs aus Scans), still in
-                # ein neues Cache-Temp-File um - dadurch landete die gespeicherte
-                # Annotation nicht mehr neben der Originaldatei/preannotation.json.
-                image = gr.Image(label="Originalscan", type="filepath", sources=["upload"], image_mode=None)
-                with gr.Row():
-                    pdf_upload = gr.File(label="PDF-Scan (mehrseitig)", file_types=[".pdf"], type="filepath")
-                    pdf_page = gr.Number(label="Seite", value=1, precision=0, minimum=1)
-                pdf_load = gr.Button("PDF-Seite laden")
-                with gr.Row():
-                    split_button = gr.Button("Originalscan in Kacheln aufteilen")
-                    tile_number = gr.Number(label="Kachel", value=1, precision=0, minimum=1)
-                load_tile_button = gr.Button("Kachel laden")
-                with gr.Row():
-                    rotate_left_button = gr.Button("↺ 90° drehen")
-                    rotate_right_button = gr.Button("↻ 90° drehen")
-                with gr.Row():
-                    model = gr.Dropdown(
-                        label="Ollama-Modell",
-                        choices=model_dropdown_choices(),
-                        value=DEFAULT_MODEL,
-                        allow_custom_value=True,
-                        scale=4,
-                    )
-                    refresh_models_button = gr.Button("🔄", scale=1, min_width=40)
-                context = gr.Number(label="Kontextgröße", value=DEFAULT_CONTEXT_SIZE, precision=0)
-                preannotate = gr.Button("Qwen-Vorannotation starten", variant="primary")
-                with gr.Row():
-                    tesseract_lang = gr.Textbox(label="Tesseract-Sprache", value=tesseract_boxes.DEFAULT_LANG)
-                    tesseract_psm = gr.Number(label="Tesseract PSM", value=tesseract_boxes.DEFAULT_PSM, precision=0)
-                tesseract_button = gr.Button("Tesseract-Boxen anwenden (Snap)")
-                undo_tesseract_button = gr.Button("Tesseract-Boxen rückgängig (zurück zur geladenen Annotation)")
-                existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
-                load = gr.Button("Scan und JSON laden")
-            with gr.Column(scale=2):
-                preview = gr.HTML(EMPTY_PREVIEW_HTML, label="Zeilenboxen", elem_id="bbox-preview-wrap")
-                # visible=False would unmount this element in Gradio 6, breaking the
-                # JS->Python bridge from render_interactive_preview; hide via CSS instead
-                # so it stays queryable while a box is dragged/resized/edited.
-                bbox_sync = gr.Textbox(elem_id="bbox-sync-box", visible=True, container=False)
-                crop = gr.Image(label="Ausgewählte Zeile", type="pil", interactive=False, height=180)
-                with gr.Row():
-                    add_box_button = gr.Button("Box hinzufügen")
-                    delete_box_button = gr.Button("Ausgewählte Box löschen")
-                    no_text_button = gr.Button("Seite ohne sichtbaren Text (leere Seite)")
-                with gr.Row():
-                    rotate_box_left_button = gr.Button("↺ Box -5°")
-                    rotate_box_right_button = gr.Button("↻ Box +5°")
-                table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number", "number"], column_count=(8, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
-        with gr.Row():
-            refresh_button = gr.Button("Änderungen übernehmen")
-            save_button = gr.Button("Annotations-JSON speichern")
-        with gr.Row():
-            dataset_root = gr.Textbox(label="Dataset-Wurzelverzeichnis", value=DEFAULT_DATASET_ROOT, placeholder=r"C:\Handschrift-Dataset")
-            export_mode = gr.Radio(["An Datei anhängen / Seite aktualisieren", "Datei ersetzen"], value="An Datei anhängen / Seite aktualisieren", label="Exportmodus")
-            export_button = gr.Button("Als Qwen-Trainings-JSONL exportieren", variant="primary")
-        with gr.Row():
-            annotation_file = gr.File(label="Annotations-JSON")
-            training_file = gr.File(label="Qwen-Trainings-JSONL")
-        status = gr.Textbox(label="Status", interactive=False)
+                with gr.Column(scale=1):
+                    # image_mode=None ist noetig, damit Gradio beim Zurueck-Einlesen des
+                    # Pfads (preprocess) den Original-Pfad unveraendert durchreicht: mit dem
+                    # Default "RGB" schreibt Gradio jedes Bild, das nicht exakt im PIL-Modus
+                    # "RGB" vorliegt (z.B. Graustufen- oder Palette-PNGs aus Scans), still in
+                    # ein neues Cache-Temp-File um - dadurch landete die gespeicherte
+                    # Annotation nicht mehr neben der Originaldatei/preannotation.json.
+                    image = gr.Image(label="Originalscan", type="filepath", sources=["upload"], image_mode=None)
+                    with gr.Row():
+                        pdf_upload = gr.File(label="PDF-Scan (mehrseitig)", file_types=[".pdf"], type="filepath")
+                        pdf_page = gr.Number(label="Seite", value=1, precision=0, minimum=1)
+                    pdf_load = gr.Button("PDF-Seite laden")
+                    with gr.Row():
+                        split_button = gr.Button("Originalscan in Kacheln aufteilen")
+                        tile_number = gr.Number(label="Kachel", value=1, precision=0, minimum=1)
+                    load_tile_button = gr.Button("Kachel laden")
+                    with gr.Row():
+                        rotate_left_button = gr.Button("↺ 90° drehen")
+                        rotate_right_button = gr.Button("↻ 90° drehen")
+                    with gr.Row():
+                        model = gr.Dropdown(
+                            label="Ollama-Modell",
+                            choices=model_dropdown_choices(),
+                            value=DEFAULT_MODEL,
+                            allow_custom_value=True,
+                            scale=4,
+                        )
+                        refresh_models_button = gr.Button("🔄", scale=1, min_width=40)
+                    context = gr.Number(label="Kontextgröße", value=DEFAULT_CONTEXT_SIZE, precision=0)
+                    preannotate = gr.Button("Qwen-Vorannotation starten", variant="primary")
+                    with gr.Row():
+                        tesseract_lang = gr.Textbox(label="Tesseract-Sprache", value=tesseract_boxes.DEFAULT_LANG)
+                        tesseract_psm = gr.Number(label="Tesseract PSM", value=tesseract_boxes.DEFAULT_PSM, precision=0)
+                    tesseract_button = gr.Button("Tesseract-Boxen anwenden (Snap)")
+                    undo_tesseract_button = gr.Button("Tesseract-Boxen rückgängig (zurück zur geladenen Annotation)")
+                    existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
+                    load = gr.Button("Scan und JSON laden")
+                with gr.Column(scale=2):
+                    preview = gr.HTML(EMPTY_PREVIEW_HTML, label="Zeilenboxen", elem_id="bbox-preview-wrap")
+                    # visible=False would unmount this element in Gradio 6, breaking the
+                    # JS->Python bridge from render_interactive_preview; hide via CSS instead
+                    # so it stays queryable while a box is dragged/resized/edited.
+                    bbox_sync = gr.Textbox(elem_id="bbox-sync-box", visible=True, container=False)
+                    crop = gr.Image(label="Ausgewählte Zeile", type="pil", interactive=False, height=180)
+                    with gr.Row():
+                        add_box_button = gr.Button("Box hinzufügen")
+                        delete_box_button = gr.Button("Ausgewählte Box löschen")
+                        no_text_button = gr.Button("Seite ohne sichtbaren Text (leere Seite)")
+                    with gr.Row():
+                        rotate_box_left_button = gr.Button("↺ Box -5°")
+                        rotate_box_right_button = gr.Button("↻ Box +5°")
+                    table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number", "number"], column_count=(8, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
+            with gr.Row():
+                refresh_button = gr.Button("Änderungen übernehmen")
+                save_button = gr.Button("Annotations-JSON speichern")
+            with gr.Row():
+                dataset_root = gr.Textbox(label="Dataset-Wurzelverzeichnis", value=DEFAULT_DATASET_ROOT, placeholder=r"C:\Handschrift-Dataset")
+                export_mode = gr.Radio(["An Datei anhängen / Seite aktualisieren", "Datei ersetzen"], value="An Datei anhängen / Seite aktualisieren", label="Exportmodus")
+                export_button = gr.Button("Als Qwen-Trainings-JSONL exportieren", variant="primary")
+            with gr.Row():
+                annotation_file = gr.File(label="Annotations-JSON")
+                training_file = gr.File(label="Qwen-Trainings-JSONL")
+            status = gr.Textbox(label="Status", interactive=False)
+        with gr.Tab("Modellvergleich"):
+            compare_page_dd, compare_run_a, compare_run_b, compare_status = build_compare_tab(dataset_root)
 
         # .upload() (not .change()) is required here: only a genuine manual
         # upload should discard the previous annotation. select_dataset_file /
@@ -2003,6 +2291,11 @@ def build_interface() -> gr.Blocks:
         )
         app.load(render_file_lists, [dataset_root, image_state], [file_list_all_html, file_list_flagged_html])
         app.load(None, None, None, js=BBOX_JS)
+        app.load(
+            compare_refresh_pages,
+            [dataset_root, compare_page_dd],
+            [compare_page_dd, compare_run_a, compare_run_b, compare_status],
+        )
     return app
 
 
@@ -2017,7 +2310,7 @@ def main() -> None:
         server_port=args.port,
         share=args.share,
         inbrowser=True,
-        head=BBOX_STYLE,
+        head=BBOX_STYLE + model_compare.COMPARE_STYLE,
     )
 
 
