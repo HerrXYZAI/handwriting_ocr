@@ -92,7 +92,7 @@ if "%INPUT_PATH%"=="" (
 echo.
 echo Optionale zusaetzliche Argumente, z.B. --model qwen3-vl:4b --verbose
 echo Groesseres Modell (12 GB VRAM + 32 GB RAM, langsamer, genauer^):
-echo   --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288
+echo   --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288 --no-mmap
 echo (Liste aller Optionen: qwen_preannotate.py --help^). Leer lassen fuer Standard.
 set "EXTRA_ARGS="
 set /p EXTRA_ARGS="Zusaetzliche Optionen: "
@@ -153,7 +153,7 @@ if "%COMPARE_MODEL%"=="" (
   goto :done
 )
 echo.
-echo Optionale Argumente, z.B. --max-side 1536 --ctx 12288 --label qwen3-vl:4b@1536 --limit 5
+echo Optionale Argumente, z.B. --max-side 1536 --ctx 12288 --no-mmap --limit 5
 set "COMPARE_ARGS="
 set /p COMPARE_ARGS="Zusaetzliche Optionen: "
 "%PYEXE%" model_compare.py run "%COMPARE_ROOT%" --model %COMPARE_MODEL% %COMPARE_ARGS%

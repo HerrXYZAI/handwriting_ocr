@@ -57,8 +57,14 @@ Antwort. Die Vorannotation schaltet den Denkmodus ohnehin ab (`--think` schaltet
 
 ```powershell
 ollama pull qwen3-vl:30b-a3b-instruct
-python qwen_preannotate.py C:\Scans --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288
+python qwen_preannotate.py C:\Scans --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288 --no-mmap
 ```
+
+- `--no-mmap`: lädt das Modell in einem Rutsch komplett in den Arbeitsspeicher, statt es per
+  mmap stückweise von der Platte nachzuladen. Bei teilweise ausgelagerten Modellen deutlich
+  schneller; ohne die Option kann Ollama das Laden mit `timed out waiting for llama-server
+  to start` abbrechen und endlos neu beginnen. Zusätzlich hilft `OLLAMA_LOAD_TIMEOUT=30m`
+  (wie die Variablen unten setzen).
 
 - `--max-side 1536`: größere Modelle profitieren stärker von mehr Auflösung der Handschrift.
 - `--ctx 12288`: bei 1536 px reicht 8192 für volle Seiten oft nicht mehr; das Log warnt,
@@ -136,7 +142,7 @@ Strg+C verliert keine fertigen Seiten:
 
 ```powershell
 python model_compare.py run C:\Handschrift-Dataset --model qwen3-vl:4b
-python model_compare.py run C:\Handschrift-Dataset --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288
+python model_compare.py run C:\Handschrift-Dataset --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288 --no-mmap
 python model_compare.py report C:\Handschrift-Dataset
 ```
 

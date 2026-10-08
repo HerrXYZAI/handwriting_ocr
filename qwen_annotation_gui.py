@@ -1912,13 +1912,15 @@ def _run_label(model: str, label: str | None) -> str:
 
 def compare_run_on_page(
     annotation_path: str | None, model: str, label: str | None, max_side: float, ctx: float, think: bool,
-    label_a: str | None, label_b: str | None, threshold: float,
+    no_mmap: bool, label_a: str | None, label_b: str | None, threshold: float,
 ):
     if not annotation_path:
         raise gr.Error("Bitte zuerst eine geprüfte Seite auswählen.")
     if not model or not model.strip():
         raise gr.Error("Bitte ein Modell wählen.")
-    opts = model_compare.run_options(model, int(max_side), int(ctx), bool(think), BACKEND, _compare_api_url(), OLLAMA_TIMEOUT)
+    opts = model_compare.run_options(
+        model, int(max_side), int(ctx), bool(think), BACKEND, _compare_api_url(), OLLAMA_TIMEOUT, no_mmap=bool(no_mmap)
+    )
     run_label = _run_label(model, label)
     try:
         run = model_compare.run_model_on_annotation(Path(annotation_path), opts, run_label)
@@ -1942,13 +1944,17 @@ def compare_run_on_page(
     )
 
 
-def compare_run_on_all(root: str, model: str, label: str | None, max_side: float, ctx: float, think: bool, force: bool):
+def compare_run_on_all(
+    root: str, model: str, label: str | None, max_side: float, ctx: float, think: bool, no_mmap: bool, force: bool
+):
     """Generator: führt das Modell auf allen geprüften Seiten ohne diesen Lauf
     aus und meldet nach jeder Seite den Fortschritt (Abbrechen jederzeit
     möglich, fertige Seiten bleiben gespeichert)."""
     if not model or not model.strip():
         raise gr.Error("Bitte ein Modell wählen.")
-    opts = model_compare.run_options(model, int(max_side), int(ctx), bool(think), BACKEND, _compare_api_url(), OLLAMA_TIMEOUT)
+    opts = model_compare.run_options(
+        model, int(max_side), int(ctx), bool(think), BACKEND, _compare_api_url(), OLLAMA_TIMEOUT, no_mmap=bool(no_mmap)
+    )
     run_label = _run_label(model, label)
     files = model_compare.find_annotation_files(root)
     todo = []
@@ -2054,6 +2060,9 @@ def build_compare_tab(dataset_root: gr.Textbox):
             run_max_side = gr.Number(label="Max. Bildseite (px)", value=1024, precision=0)
             run_ctx = gr.Number(label="Kontextgröße", value=8192, precision=0)
             run_think = gr.Checkbox(label="Denkmodus (thinking)", value=False)
+            run_no_mmap = gr.Checkbox(
+                label="Modell komplett in RAM laden (kein mmap; empfohlen für große Modelle)", value=True
+            )
             run_force = gr.Checkbox(label="Vorhandene Läufe mit gleichem Label überschreiben (nur 'alle Seiten')", value=False)
         with gr.Row():
             run_page_button = gr.Button("Auf dieser Seite ausführen")
@@ -2075,12 +2084,12 @@ def build_compare_tab(dataset_root: gr.Textbox):
     )
     run_page_button.click(
         compare_run_on_page,
-        [page, run_model, run_label, run_max_side, run_ctx, run_think, run_a, run_b, iou_threshold],
+        [page, run_model, run_label, run_max_side, run_ctx, run_think, run_no_mmap, run_a, run_b, iou_threshold],
         [run_a, run_b, *page_outputs, compare_status],
     )
     run_all_event = run_all_button.click(
         compare_run_on_all,
-        [dataset_root, run_model, run_label, run_max_side, run_ctx, run_think, run_force],
+        [dataset_root, run_model, run_label, run_max_side, run_ctx, run_think, run_no_mmap, run_force],
         compare_status,
     )
     run_stop_button.click(None, None, None, cancels=[run_all_event])

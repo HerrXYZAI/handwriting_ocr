@@ -294,10 +294,11 @@ def call_qwen(
     backend: str,
     api_url: str,
     think: bool = False,
+    no_mmap: bool = False,
 ) -> dict[str, Any]:
     if backend == "llamacpp":
         return _call_llamacpp(image, model, timeout, tile_index, api_url, think)
-    return _call_ollama(image, model, context, timeout, tile_index, api_url, think)
+    return _call_ollama(image, model, context, timeout, tile_index, api_url, think, no_mmap)
 
 
 def _post_ollama_stream(api_url: str, payload: dict[str, Any], timeout: int) -> requests.Response:
@@ -317,8 +318,23 @@ def _post_ollama_stream(api_url: str, payload: dict[str, Any], timeout: int) -> 
 
 
 def _call_ollama(
-    image: Image.Image, model: str, context: int, timeout: int, tile_index: int, api_url: str, think: bool = False
+    image: Image.Image,
+    model: str,
+    context: int,
+    timeout: int,
+    tile_index: int,
+    api_url: str,
+    think: bool = False,
+    no_mmap: bool = False,
 ) -> dict[str, Any]:
+    options: dict[str, Any] = {"temperature": 0, "num_ctx": context}
+    if no_mmap:
+        # Modell beim Laden komplett in den Arbeitsspeicher lesen statt per
+        # mmap stückweise nachzuladen. Bei teilweise auf die CPU ausgelagerten
+        # Modellen (z.B. MoE-Experten im RAM) lädt das deutlich schneller und
+        # verhindert, dass Ollama das Laden wegen Zeitüberschreitung abbricht
+        # ("timed out waiting for llama-server to start").
+        options["use_mmap"] = False
     payload = {
         "model": model,
         "messages": [{
@@ -333,7 +349,7 @@ def _call_ollama(
         # auf die CPU ausgelagerten Modellen viel Zeit und füllt den Kontext, bevor
         # das JSON überhaupt beginnt. Für reine Instruct-Modelle ohne Wirkung.
         "think": bool(think),
-        "options": {"temperature": 0, "num_ctx": context},
+        "options": options,
     }
     LOG.info(
         "Ollama-Anfrage für Abschnitt %d: URL=%s, Modell=%s, Kontext=%d, Bild=%dx%d, Denken=%s",
@@ -547,7 +563,8 @@ def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
     prepared = scale_for_model(tile.image, args.max_side, args.upscale)
     LOG.info("Abschnitt %d: Bereich %s, Modellbild %d x %d", tile.index, tile.box, prepared.width, prepared.height)
     result = call_qwen(
-        prepared, args.model, args.ctx, args.timeout, tile.index, args.backend, args.api_url, args.think
+        prepared, args.model, args.ctx, args.timeout, tile.index, args.backend, args.api_url, args.think,
+        getattr(args, "no_mmap", False),
     )
     raw_lines = result.get("lines", [])
     if not isinstance(raw_lines, list):
@@ -619,6 +636,7 @@ def build_processing_block(args: argparse.Namespace, log_file: Path, tile_count:
         "model": args.model,
         "context_size": args.ctx,
         "think": args.think,
+        "no_mmap": args.no_mmap,
         "max_model_image_side": args.max_side,
         "tile_trigger": args.tile_trigger,
         "tile_size": args.tile_size,
@@ -883,6 +901,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CONTEXT,
         help=f"Ollama-Kontextgröße; Standard: {DEFAULT_CONTEXT}. Bei --max-side 1536 und "
         "vollen Seiten ggf. 12288.",
+    )
+    parser.add_argument(
+        "--no-mmap",
+        action="store_true",
+        help="Modell beim Laden komplett in den Arbeitsspeicher lesen (Ollama use_mmap=false). "
+        "Empfohlen für große, teilweise auf die CPU ausgelagerte Modelle: lädt schneller und "
+        "verhindert Abbrüche mit 'timed out waiting for llama-server to start'.",
     )
     parser.add_argument(
         "--think",

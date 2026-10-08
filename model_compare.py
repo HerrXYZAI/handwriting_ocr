@@ -148,6 +148,7 @@ def run_options(
     api_url: str | None = None,
     timeout: int = 1800,
     upscale: bool = False,
+    no_mmap: bool = False,
 ) -> argparse.Namespace:
     """Dieselben Parameter, die qwen_preannotate.run_tile erwartet."""
     if api_url is None:
@@ -161,6 +162,7 @@ def run_options(
         api_url=api_url,
         timeout=int(timeout),
         upscale=bool(upscale),
+        no_mmap=bool(no_mmap),
     )
 
 
@@ -222,6 +224,7 @@ def run_model_on_annotation(
             "context_size": opts.ctx,
             "think": opts.think,
             "upscale": opts.upscale,
+            "no_mmap": getattr(opts, "no_mmap", False),
             "prompt_sha1": hashlib.sha1(qp.PROMPT.encode("utf-8")).hexdigest()[:10],
         },
         "lines": [
@@ -683,6 +686,11 @@ def main() -> None:
     run.add_argument("--max-side", type=qp.positive_int, default=qp.DEFAULT_MAX_SIDE)
     run.add_argument("--ctx", type=qp.positive_int, default=qp.DEFAULT_CONTEXT)
     run.add_argument("--think", action="store_true")
+    run.add_argument(
+        "--no-mmap",
+        action="store_true",
+        help="Modell komplett in den Arbeitsspeicher laden (Ollama use_mmap=false); empfohlen für große Modelle",
+    )
     run.add_argument("--upscale", action="store_true")
     run.add_argument("--backend", choices=("ollama", "llamacpp"), default=qp.DEFAULT_BACKEND)
     run.add_argument("--api-url", default=None)
@@ -700,7 +708,10 @@ def main() -> None:
         _print_summary(args.root, args.iou, not args.all_pages)
         return
 
-    opts = run_options(args.model, args.max_side, args.ctx, args.think, args.backend, args.api_url, args.timeout, args.upscale)
+    opts = run_options(
+        args.model, args.max_side, args.ctx, args.think, args.backend, args.api_url, args.timeout, args.upscale,
+        args.no_mmap,
+    )
     label = args.label or default_label(opts)
     files = find_annotation_files(args.root)
     todo = []
