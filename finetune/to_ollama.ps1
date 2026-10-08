@@ -41,8 +41,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Konsolenausgabe mit Zeitstempel (gleiches Format wie die Python-Skripte).
+function Write-Log([string]$Message) {
+    if ($Message) { Write-Host ("{0} | {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message) } else { Write-Host "" }
+}
+function Write-LogError([string]$Message) {
+    Write-Error ("{0} | {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message)
+}
+
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
-    Write-Error "Docker wurde nicht gefunden. Bitte Docker Desktop installieren und starten."
+    Write-LogError "Docker wurde nicht gefunden. Bitte Docker Desktop installieren und starten."
     exit 1
 }
 
@@ -58,15 +66,15 @@ if (Get-Command ollama -ErrorAction SilentlyContinue) {
     $running = docker ps --filter "name=^/${OllamaContainer}$" --format "{{.Names}}" 2>$null
     if ($running -eq $OllamaContainer) {
         $OllamaMode = "docker"
-        Write-Host "Ollama-CLI nicht lokal gefunden, verwende laufenden Docker-Container '$OllamaContainer'."
+        Write-Log "Ollama-CLI nicht lokal gefunden, verwende laufenden Docker-Container '$OllamaContainer'."
     } else {
-        Write-Error "Ollama wurde nicht gefunden: weder lokal im PATH noch als laufender Docker-Container '$OllamaContainer'. Bitte Ollama installieren, den Container starten, oder -OllamaContainer mit dem richtigen Namen angeben."
+        Write-LogError "Ollama wurde nicht gefunden: weder lokal im PATH noch als laufender Docker-Container '$OllamaContainer'. Bitte Ollama installieren, den Container starten, oder -OllamaContainer mit dem richtigen Namen angeben."
         exit 1
     }
 }
 
 if (-not (Test-Path $MergedDir)) {
-    Write-Error "MergedDir nicht gefunden: $MergedDir"
+    Write-LogError "MergedDir nicht gefunden: $MergedDir"
     exit 1
 }
 $MergedDir = (Resolve-Path $MergedDir).Path
@@ -82,7 +90,7 @@ $TokenizerConfigPath = Join-Path $MergedDir "tokenizer_config.json"
 if (Test-Path $TokenizerConfigPath) {
     $tokenizerConfig = Get-Content $TokenizerConfigPath -Raw | ConvertFrom-Json
     if ($tokenizerConfig.PSObject.Properties.Name -contains "extra_special_tokens") {
-        Write-Host "Entferne inkompatibles 'extra_special_tokens'-Feld aus tokenizer_config.json..."
+        Write-Log "Entferne inkompatibles 'extra_special_tokens'-Feld aus tokenizer_config.json..."
         $tokenizerConfig.PSObject.Properties.Remove("extra_special_tokens")
         $utf8NoBom = New-Object System.Text.UTF8Encoding $false
         [System.IO.File]::WriteAllText($TokenizerConfigPath, ($tokenizerConfig | ConvertTo-Json -Depth 10), $utf8NoBom)
@@ -100,31 +108,31 @@ $TextGguf = "model-f16.gguf"
 $MmprojGguf = "mmproj-f16.gguf"
 $QuantGguf = "model-$Quant.gguf"
 
-Write-Host "1/4 Konvertiere Textmodell nach GGUF (f16)..."
+Write-Log "1/4 Konvertiere Textmodell nach GGUF (f16)..."
 docker run --rm -v "${MergedDir}:/model:ro" -v "${GgufDir}:/gguf" $LlamaCppImage `
     --convert /model --outfile "/gguf/$TextGguf" --outtype f16
-if ($LASTEXITCODE -ne 0) { Write-Error "Konvertierung des Textmodells fehlgeschlagen."; exit 1 }
+if ($LASTEXITCODE -ne 0) { Write-LogError "Konvertierung des Textmodells fehlgeschlagen."; exit 1 }
 
-Write-Host "2/4 Exportiere Vision-Projektor (mmproj, f16)..."
+Write-Log "2/4 Exportiere Vision-Projektor (mmproj, f16)..."
 docker run --rm -v "${MergedDir}:/model:ro" -v "${GgufDir}:/gguf" $LlamaCppImage `
     --convert /model --outfile "/gguf/$MmprojGguf" --outtype f16 --mmproj
-if ($LASTEXITCODE -ne 0) { Write-Error "Export des Vision-Projektors fehlgeschlagen."; exit 1 }
+if ($LASTEXITCODE -ne 0) { Write-LogError "Export des Vision-Projektors fehlgeschlagen."; exit 1 }
 
-Write-Host "3/4 Quantisiere Textmodell nach $Quant..."
+Write-Log "3/4 Quantisiere Textmodell nach $Quant..."
 docker run --rm -v "${GgufDir}:/gguf" $LlamaCppImage `
     --quantize "/gguf/$TextGguf" "/gguf/$QuantGguf" $Quant
-if ($LASTEXITCODE -ne 0) { Write-Error "Quantisierung fehlgeschlagen."; exit 1 }
+if ($LASTEXITCODE -ne 0) { Write-LogError "Quantisierung fehlgeschlagen."; exit 1 }
 
 $ModelfilePath = Join-Path $GgufDir "Modelfile"
 $ModelfileContent = "FROM ./$QuantGguf`nFROM ./$MmprojGguf`n"
 Set-Content -Path $ModelfilePath -Value $ModelfileContent -Encoding utf8 -NoNewline
 
-Write-Host "4/4 Importiere als '$ModelName' in Ollama..."
+Write-Log "4/4 Importiere als '$ModelName' in Ollama..."
 if ($OllamaMode -eq "local") {
     Push-Location $GgufDir
     try {
         ollama create $ModelName -f Modelfile
-        if ($LASTEXITCODE -ne 0) { Write-Error "ollama create fehlgeschlagen."; exit 1 }
+        if ($LASTEXITCODE -ne 0) { Write-LogError "ollama create fehlgeschlagen."; exit 1 }
     } finally {
         Pop-Location
     }
@@ -132,27 +140,27 @@ if ($OllamaMode -eq "local") {
 } else {
     $ContainerDir = "/tmp/ollama-import-$ModelName"
     docker exec $OllamaContainer sh -c "rm -rf '$ContainerDir' && mkdir -p '$ContainerDir'"
-    if ($LASTEXITCODE -ne 0) { Write-Error "Konnte Import-Verzeichnis im Container '$OllamaContainer' nicht anlegen."; exit 1 }
+    if ($LASTEXITCODE -ne 0) { Write-LogError "Konnte Import-Verzeichnis im Container '$OllamaContainer' nicht anlegen."; exit 1 }
     docker cp $ModelfilePath "${OllamaContainer}:${ContainerDir}/Modelfile"
     docker cp (Join-Path $GgufDir $QuantGguf) "${OllamaContainer}:${ContainerDir}/$QuantGguf"
     docker cp (Join-Path $GgufDir $MmprojGguf) "${OllamaContainer}:${ContainerDir}/$MmprojGguf"
     docker exec -w $ContainerDir $OllamaContainer ollama create $ModelName -f Modelfile
-    if ($LASTEXITCODE -ne 0) { Write-Error "ollama create fehlgeschlagen (im Container '$OllamaContainer')."; exit 1 }
+    if ($LASTEXITCODE -ne 0) { Write-LogError "ollama create fehlgeschlagen (im Container '$OllamaContainer')."; exit 1 }
     docker exec $OllamaContainer sh -c "rm -rf '$ContainerDir'"
     $RunHint = "docker exec -it $OllamaContainer ollama run $ModelName"
 }
 
-Write-Host ""
-Write-Host "Fertig. GGUF-Dateien liegen in: $GgufDir"
-Write-Host "Testen mit: $RunHint"
-Write-Host ""
-Write-Host "Bekannte Einschraenkung: der Import von selbst konvertierten Qwen3-VL-"
-Write-Host "GGUF+mmproj-Paaren in Ollama ist noch nicht durchgehend stabil (Stand"
-Write-Host "jetzt gibt es offene Ollama-Bugs, bei denen 'ollama show' das Modell"
-Write-Host "korrekt als vision-faehig erkennt, ein Bild aber trotzdem zum Absturz"
-Write-Host "des Model-Runners fuehrt). Falls 'ollama run' bei einem Bild abstuerzt"
-Write-Host "oder mit 'model runner has unexpectedly stopped' fehlschlaegt, das"
-Write-Host "Modell ersatzweise direkt mit llama.cpp statt Ollama testen:"
-Write-Host "  docker run --rm -p 8080:8080 -v `"${GgufDir}:/gguf`" $LlamaCppImage --server -m /gguf/$QuantGguf --mmproj /gguf/$MmprojGguf --host 0.0.0.0"
-Write-Host "und qwen_annotation_gui.py/qwen_preannotate.py voruebergehend auf"
-Write-Host "dessen OpenAI-kompatible API (http://127.0.0.1:8080) statt Ollama zeigen."
+Write-Log ""
+Write-Log "Fertig. GGUF-Dateien liegen in: $GgufDir"
+Write-Log "Testen mit: $RunHint"
+Write-Log ""
+Write-Log "Bekannte Einschraenkung: der Import von selbst konvertierten Qwen3-VL-"
+Write-Log "GGUF+mmproj-Paaren in Ollama ist noch nicht durchgehend stabil (Stand"
+Write-Log "jetzt gibt es offene Ollama-Bugs, bei denen 'ollama show' das Modell"
+Write-Log "korrekt als vision-faehig erkennt, ein Bild aber trotzdem zum Absturz"
+Write-Log "des Model-Runners fuehrt). Falls 'ollama run' bei einem Bild abstuerzt"
+Write-Log "oder mit 'model runner has unexpectedly stopped' fehlschlaegt, das"
+Write-Log "Modell ersatzweise direkt mit llama.cpp statt Ollama testen:"
+Write-Log "  docker run --rm -p 8080:8080 -v `"${GgufDir}:/gguf`" $LlamaCppImage --server -m /gguf/$QuantGguf --mmproj /gguf/$MmprojGguf --host 0.0.0.0"
+Write-Log "und qwen_annotation_gui.py/qwen_preannotate.py voruebergehend auf"
+Write-Log "dessen OpenAI-kompatible API (http://127.0.0.1:8080) statt Ollama zeigen."

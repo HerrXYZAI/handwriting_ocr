@@ -18,6 +18,7 @@ from PIL import Image, ImageOps
 import pdf_utils
 import tesseract_boxes
 from tiling import Tile, create_tiles, save_tiles
+from console import run_main, tprint
 
 OLLAMA_API = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434/api/chat")
 LLAMACPP_API = os.environ.get("LLAMACPP_API", "http://127.0.0.1:8080/v1/chat/completions")
@@ -693,15 +694,15 @@ def process_folder(args: argparse.Namespace, folder: Path) -> list[Path]:
     # unverarbeitet ließ, sobald mindestens eine Seite bereits vorannotiert war.
     outputs: list[Path] = []
     for index, item in enumerate(items, 1):
-        print(f"[{index}/{len(items)}] Verarbeite: {item.name}")
+        tprint(f"[{index}/{len(items)}] Verarbeite: {item.name}")
         item_args = argparse.Namespace(**vars(args))
         item_args.image = str(item)
         try:
             outputs.extend(process_scan(item_args))
         except Exception as error:
-            print(f"FEHLER bei {item.name}: {error}", file=sys.stderr)
+            tprint(f"FEHLER bei {item.name}: {error}", file=sys.stderr)
 
-    print(f"Ordner fertig: {len(items)} Datei(en) verarbeitet (bereits vorhandene Seiten/Kacheln je Datei einzeln übersprungen, siehe Ausgabe/Log oben).")
+    tprint(f"Ordner fertig: {len(items)} Datei(en) verarbeitet (bereits vorhandene Seiten/Kacheln je Datei einzeln übersprungen, siehe Ausgabe/Log oben).")
     return outputs
 
 
@@ -747,7 +748,7 @@ def process_page(args: argparse.Namespace, source: Path) -> list[Path]:
     output, log_file = resolve_page_paths(args, source)
 
     if len(tiles) == 1 and output.is_file() and not args.force:
-        print(f"Bereits vorhanden, übersprungen: {output}")
+        tprint(f"Bereits vorhanden, übersprungen: {output}")
         return [output]
 
     configure_logging(log_file, args.verbose)
@@ -988,11 +989,11 @@ def main() -> None:
         raise SystemExit(130)
     except Exception as error:
         if not LOG.handlers:
-            print(f"FEHLER: {error}", file=sys.stderr)
+            tprint(f"FEHLER: {error}", file=sys.stderr)
         else:
             LOG.error("Verarbeitung abgebrochen: %s", error)
         raise SystemExit(1)
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

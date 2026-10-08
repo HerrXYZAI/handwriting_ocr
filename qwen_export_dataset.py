@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import qwen_annotation_gui as gui
+from console import run_main, tprint
 
 
 def find_annotation_files(folder: Path) -> list[Path]:
@@ -65,7 +66,7 @@ def main() -> None:
 
     records, warnings = build_dataset(folder, dataset_root)
     for warning in warnings:
-        print(f"Übersprungen: {warning}", file=sys.stderr)
+        tprint(f"Übersprungen: {warning}", file=sys.stderr)
     if not records:
         raise SystemExit(f"Keine verwertbaren *_annotation.json-Dateien in {folder} gefunden.")
 
@@ -74,8 +75,8 @@ def main() -> None:
         encoding="utf-8",
         newline="\n",
     )
-    print(f"Geschrieben: {output} ({len(records)} Datensätze, {len(warnings)} übersprungen)")
+    tprint(f"Geschrieben: {output} ({len(records)} Datensätze, {len(warnings)} übersprungen)")
 
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

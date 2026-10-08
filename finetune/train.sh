@@ -5,6 +5,9 @@
 #   ./train.sh --num_train_epochs 5 --freeze_vit false
 set -euo pipefail
 
+# Konsolenausgabe mit Zeitstempel (gleiches Format wie die Python-Skripte).
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $*"; }
+
 MODEL="${FT_MODEL:-Qwen/Qwen3-VL-4B-Instruct}"
 DATASET="${FT_DATASET:-/data/train_swift.jsonl}"
 OUTPUT_DIR="${FT_OUTPUT_DIR:-/output/qwen3-vl-4b-handschrift}"
@@ -18,6 +21,7 @@ MAX_LENGTH="${FT_MAX_LENGTH:-8192}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+log "Starte Training: $MODEL, Datensatz $DATASET, Ausgabe $OUTPUT_DIR, $EPOCHS Epochen"
 swift sft \
     --model "$MODEL" \
     --tuner_type lora \
@@ -48,3 +52,4 @@ swift sft \
     --dataloader_num_workers 2 \
     --output_dir "$OUTPUT_DIR" \
     "$@"
+log "Training beendet."

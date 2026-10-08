@@ -3,6 +3,9 @@
 # Aufruf: ./merge.sh /output/qwen3-vl-4b-handschrift/checkpoint-XXX [Ausgabeordner]
 set -euo pipefail
 
+# Konsolenausgabe mit Zeitstempel (gleiches Format wie die Python-Skripte).
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') | $*"; }
+
 ADAPTERS="${1:?Aufruf: merge.sh <adapter_checkpoint_verzeichnis> [ausgabeordner]}"
 OUTPUT_DIR="${2:-${ADAPTERS%/}-merged}"
 
@@ -43,16 +46,17 @@ trap cleanup EXIT
 # sonst stillschweigend einen erneuten Lauf: swift export ueberspringt das
 # Merging komplett, wenn OUTPUT_DIR bereits existiert.
 if [ -d "$OUTPUT_DIR" ]; then
-    echo "Entferne vorhandenen Ausgabeordner: $OUTPUT_DIR"
+    log "Entferne vorhandenen Ausgabeordner: $OUTPUT_DIR"
     rm -rf "$OUTPUT_DIR"
 fi
 
+log "Starte Merge: $ADAPTERS -> $OUTPUT_DIR"
 swift export \
     --adapters "$PATCHED_ADAPTERS" \
     --merge_lora true \
     --output_dir "$OUTPUT_DIR"
 
 echo ""
-echo "Zusammengeführtes Modell: $OUTPUT_DIR"
-echo "Naechster Schritt: mit llama.cpp's convert-Skript nach GGUF konvertieren,"
-echo "dann per Modelfile mit 'ollama create' registrieren."
+log "Zusammengeführtes Modell: $OUTPUT_DIR"
+log "Naechster Schritt: mit llama.cpp's convert-Skript nach GGUF konvertieren,"
+log "dann per Modelfile mit 'ollama create' registrieren."

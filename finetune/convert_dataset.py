@@ -12,10 +12,19 @@ Trainings-Container:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import re
+import sys
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+
+def tprint(*values: Any, file: Any = None) -> None:
+    """print() mit Zeitstempel (gleiches Format wie console.py im Hauptordner;
+    hier eigenständig, da dieses Skript auch allein im Container läuft)."""
+    stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{stamp} | " + " ".join(str(v) for v in values), file=file or sys.stdout, flush=True)
 
 # Bildpfade wurden von einem Windows-Python-Prozess geschrieben (Path.as_posix()),
 # koennen also "C:/..."-Laufwerksbuchstaben enthalten. PurePosixPath.is_absolute()
@@ -92,11 +101,11 @@ def convert_file(input_path: Path, output_path: Path, mount_point: str) -> tuple
                 record = json.loads(line)
                 converted, warnings = convert_record(record, mount_point)
             except Exception as error:
-                print(f"Uebersprungen (Zeile {line_number}): {error}")
+                tprint(f"Uebersprungen (Zeile {line_number}): {error}")
                 skipped += 1
                 continue
             for warning in warnings:
-                print(f"Warnung (Zeile {line_number}): {warning}")
+                tprint(f"Warnung (Zeile {line_number}): {warning}")
             target.write(json.dumps(converted, ensure_ascii=False) + "\n")
             written += 1
     return written, skipped
@@ -118,11 +127,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     if not args.input.is_file():
-        raise SystemExit(f"Eingabedatei nicht gefunden: {args.input}")
+        tprint(f"Eingabedatei nicht gefunden: {args.input}", file=sys.stderr)
+        raise SystemExit(1)
     written, skipped = convert_file(args.input, args.output, args.mount_point)
     if written == 0:
-        raise SystemExit(f"Keine verwertbaren Datensaetze in {args.input} gefunden.")
-    print(f"Geschrieben: {args.output} ({written} Datensaetze, {skipped} uebersprungen)")
+        tprint(f"Keine verwertbaren Datensaetze in {args.input} gefunden.", file=sys.stderr)
+        raise SystemExit(1)
+    tprint(f"Geschrieben: {args.output} ({written} Datensaetze, {skipped} uebersprungen)")
 
 
 if __name__ == "__main__":

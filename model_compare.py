@@ -45,6 +45,7 @@ from PIL import Image
 
 import qwen_preannotate as qp
 from tiling import Tile
+from console import run_main, tprint
 
 try:  # Schnell (C-Implementierung), falls installiert - sonst reines Python.
     from rapidfuzz.distance import Levenshtein as _RFLevenshtein
@@ -663,16 +664,16 @@ COMPARE_STYLE = """
 
 def _print_summary(root: str, threshold: float, only_common: bool) -> None:
     rows, total_pages, compared = summarize(root, threshold, only_common)
-    print(f"Geprüfte Seiten: {total_pages}, verglichen: {compared} (IoU-Schwelle {threshold})")
+    tprint(f"Geprüfte Seiten: {total_pages}, verglichen: {compared} (IoU-Schwelle {threshold})")
     if not rows:
-        print("Noch keine Modellläufe vorhanden.")
+        tprint("Noch keine Modellläufe vorhanden.")
         return
     table = [SUMMARY_HEADERS, *summary_table(rows)]
     widths = [max(len(str(row[i])) for row in table) for i in range(len(SUMMARY_HEADERS))]
     for index, row in enumerate(table):
-        print("  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)))
+        tprint("  ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)))
         if index == 0:
-            print("  ".join("-" * w for w in widths))
+            tprint("  ".join("-" * w for w in widths))
 
 
 def main() -> None:
@@ -720,10 +721,10 @@ def main() -> None:
             if args.force or label not in get_runs(load_json(path)):
                 todo.append(path)
         except (OSError, json.JSONDecodeError) as error:
-            print(f"Übersprungen (nicht lesbar): {path}: {error}", file=sys.stderr)
+            tprint(f"Übersprungen (nicht lesbar): {path}: {error}", file=sys.stderr)
     if args.limit:
         todo = todo[: args.limit]
-    print(f"{len(files)} geprüfte Seiten, {len(todo)} davon ohne Lauf '{label}' -> werden verarbeitet.")
+    tprint(f"{len(files)} geprüfte Seiten, {len(todo)} davon ohne Lauf '{label}' -> werden verarbeitet.")
 
     durations = []
     for index, path in enumerate(todo, 1):
@@ -731,23 +732,23 @@ def main() -> None:
         if durations:
             remaining = sum(durations) / len(durations) * (len(todo) - index + 1)
             eta = f", Rest ca. {fmt_duration(remaining)}"
-        print(f"[{index}/{len(todo)}] {path}{eta}", flush=True)
+        tprint(f"[{index}/{len(todo)}] {path}{eta}", flush=True)
         try:
             result = run_model_on_annotation(path, opts, label, quiet_console=True)
             durations.append(result["duration_s"])
-            print(
+            tprint(
                 f"    {len(result['lines'])} Zeilen in {fmt_duration(result['duration_s'])} "
                 f"(Details: {path.name[: -len(ANNOTATION_SUFFIX)]}_modelrun.log)"
             )
         except KeyboardInterrupt:
-            print("Abgebrochen. Bereits fertige Seiten sind gespeichert.")
+            tprint("Abgebrochen. Bereits fertige Seiten sind gespeichert.")
             break
         except Exception as error:  # eine Seite darf den Lauf nicht abbrechen
-            print(f"    FEHLER: {error}", file=sys.stderr)
-    print()
+            tprint(f"    FEHLER: {error}", file=sys.stderr)
+    tprint()
     _print_summary(args.root, DEFAULT_IOU, True)
 
 
 if __name__ == "__main__":
     logging.getLogger("qwen_preannotate").setLevel(logging.INFO)
-    main()
+    run_main(main)
