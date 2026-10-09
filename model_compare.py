@@ -44,6 +44,7 @@ from typing import Any, Iterable
 from PIL import Image
 
 import qwen_preannotate as qp
+import review
 from tiling import Tile
 from console import run_main, tprint
 
@@ -290,11 +291,16 @@ def _reading_order(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(lines, key=lambda line: (line["box"][1], line["box"][0]))
 
 
+IGNORED_COLOR = "#8D8D8D"
+
+
 def reference_lines(data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Geprüfte Zeilen mit Text; als 'kein sichtbarer Text' markierte entfallen."""
+    """Referenz = akzeptierte Zeilen mit Text (Prüfstatus je Box, siehe
+    review.py). Nicht akzeptierte und offene Zeilen sind keine Referenz,
+    ihre Bereiche werden bei der Bewertung ausgeklammert (ignored_regions)."""
     result = []
     for line in data.get("lines", []):
-        if not isinstance(line, dict) or line.get("status") == NO_TEXT_STATUS:
+        if not isinstance(line, dict) or not review.is_training_line(line):
             continue
         text = normalize_text(line.get("text_corrected", line.get("text", "")))
         box = line.get("bbox_pixels")
@@ -302,6 +308,38 @@ def reference_lines(data: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         result.append({"box": [float(v) for v in box], "text": text, "angle": float(line.get("angle", 0) or 0)})
     return _reading_order(result)
+
+
+def ignored_regions(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """Boxen nicht akzeptierter/offener Zeilen: Was das Modell dort liest,
+    wird weder als richtig noch als falsch gewertet."""
+    result = []
+    for line in data.get("lines", []):
+        box = line.get("bbox_pixels") if isinstance(line, dict) else None
+        if isinstance(box, list) and len(box) == 4 and review.is_excluded_region(line):
+            result.append({
+                "box": [float(v) for v in box],
+                "text": normalize_text(line.get("text_corrected", line.get("text", ""))),
+                "angle": float(line.get("angle", 0) or 0),
+                "review": review.review_state(line),
+            })
+    return result
+
+
+def scored_predictions(
+    data: dict[str, Any], run: dict[str, Any], threshold: float = DEFAULT_IOU
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Teilt die Modellzeilen in bewertete und ausgeklammerte. Ausgeklammert
+    wird eine Modellzeile, die mindestens so gut auf eine nicht akzeptierte/
+    offene Zeile passt (IoU >= Schwelle) wie auf jede akzeptierte."""
+    ref = reference_lines(data)
+    ignored = ignored_regions(data)
+    kept, skipped = [], []
+    for line in run_lines(run):
+        best_ignored = max((iou(line["box"], r["box"]) for r in ignored), default=0.0)
+        best_ref = max((iou(line["box"], r["box"]) for r in ref), default=0.0)
+        (skipped if best_ignored >= threshold and best_ignored >= best_ref else kept).append(line)
+    return kept, skipped
 
 
 def run_lines(run: dict[str, Any]) -> list[dict[str, Any]]:
@@ -352,7 +390,7 @@ def run_matches_image(data: dict[str, Any], run: dict[str, Any]) -> bool:
 
 def page_metrics(data: dict[str, Any], run: dict[str, Any], threshold: float = DEFAULT_IOU) -> dict[str, Any]:
     ref = reference_lines(data)
-    pred = run_lines(run)
+    pred, _ = scored_predictions(data, run, threshold)
     ref_text = " ".join(line["text"] for line in ref)
     pred_text = " ".join(line["text"] for line in pred)
     ref_words, pred_words = ref_text.split(), pred_text.split()
@@ -574,10 +612,11 @@ def overlay_html(
     width, height = image.size
     ref = reference_lines(data)
     pred: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     matched: dict[int, tuple[int, float]] = {}
     extra: set[int] = set()
     if run is not None:
-        pred = run_lines(run)
+        pred, skipped = scored_predictions(data, run, threshold)
         matched, extra = match_lines(ref, pred, threshold)
     # Mouse-over: erkannter Text je Box. Referenzboxen zeigen zusätzlich, was
     # das Modell dort gelesen hat; Modellboxen zusätzlich die Referenz - so ist
@@ -592,6 +631,20 @@ def overlay_html(
             else:
                 tip.append(_tip_line("Modell:", "— keine passende Box", color))
         parts.append(_box_div(line["box"], width, height, REF_COLOR, str(ri + 1), False, line["angle"], "<br>".join(tip)))
+    # Nicht akzeptierte/offene Zeilen: grau, werden nicht bewertet.
+    state_names = {review.REJECTED: "nicht akzeptiert", review.OPEN: "offen"}
+    for region in ignored_regions(data):
+        tip = [
+            _tip_line(f"Referenz ({state_names.get(region['review'], 'offen')}):", region["text"] or "—", IGNORED_COLOR),
+            "<i style='color:#bbb'>nicht geprüft/akzeptiert - wird nicht bewertet</i>",
+        ]
+        parts.append(_box_div(region["box"], width, height, IGNORED_COLOR, "–", False, region["angle"], "<br>".join(tip)))
+    for line in skipped:
+        tip = [
+            _tip_line("Modell:", line["text"], IGNORED_COLOR),
+            "<i style='color:#bbb'>liegt in einer nicht akzeptierten/offenen Zeile - nicht bewertet</i>",
+        ]
+        parts.append(_box_div(line["box"], width, height, IGNORED_COLOR, "–", True, line["angle"], "<br>".join(tip)))
     pred_to_ref = {pi: (ri, overlap) for ri, (pi, overlap) in matched.items()}
     for pi, line in enumerate(pred):
         box_color = color if pi not in extra else "#DA1E28"
@@ -610,7 +663,8 @@ def overlay_html(
         f"<div class='mc-legend'><b>{_esc(title)}</b> &nbsp; "
         f"<span style='color:{REF_COLOR}'>━ Referenz</span> &nbsp; "
         f"<span style='color:{color}'>┅ Modell (zugeordnet)</span> &nbsp; "
-        f"<span style='color:#DA1E28'>┅ Modell (zusätzlich, ohne Referenz)</span></div>"
+        f"<span style='color:#DA1E28'>┅ Modell (zusätzlich, ohne Referenz)</span> &nbsp; "
+        f"<span style='color:{IGNORED_COLOR}'>grau = nicht akzeptiert/offen, nicht bewertet</span></div>"
     )
     return (
         f"{legend}<div class='mc-canvas'><img class='mc-image' src='{_encode_display_image(image)}' />"
@@ -637,7 +691,7 @@ def line_table_html(data: dict[str, Any], runs: list[tuple[str, dict[str, Any]]]
     ref = reference_lines(data)
     per_run = []
     for label, run in runs:
-        pred = run_lines(run)
+        pred, _ = scored_predictions(data, run, threshold)
         matched, extra = match_lines(ref, pred, threshold)
         per_run.append((label, pred, matched, extra))
 

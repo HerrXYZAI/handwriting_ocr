@@ -14,16 +14,17 @@ import re
 import shutil
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import gradio as gr
 import requests
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageOps, ImageStat
 
 import model_compare
 import model_runs
 import qwen_preannotate
+import review
 import pdf_utils
 import tesseract_boxes
 import tiling
@@ -44,7 +45,9 @@ OLLAMA_TIMEOUT = int(os.environ.get("QWEN_TIMEOUT", "7200"))
 DEFAULT_CONTEXT_SIZE = 4096
 DEFAULT_DATASET_ROOT = r"C:\test\handwriting_ocr\pictures_for_OCR"
 CONFIDENCE_VALUES = {"high", "medium", "low"}
-TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1_px", "y1_px", "x2_px", "y2_px", "Winkel (°)"]
+TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1_px", "y1_px", "x2_px", "y2_px", "Winkel (°)", "Prüfung"]
+TABLE_DATATYPES = ["str", "str", "str", "number", "number", "number", "number", "number", "str"]
+TABLE_COLUMN_WIDTHS = ["9%", "37%", "8%", "7%", "7%", "7%", "7%", "7%", "11%"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
 DATASET_FILE_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
 
@@ -238,6 +241,7 @@ def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
             "text_corrected": text,
             "confidence": confidence,
             "status": "unreviewed",
+            "review": review.OPEN,
             "angle": normalize_angle(item.get("angle", 0)),
         })
     result.sort(key=lambda x: (x["bbox_1000"][1], x["bbox_1000"][0]))
@@ -280,6 +284,9 @@ def ensure_pixel_boxes(annotation: dict[str, Any], image_path: str) -> dict[str,
         confidence = str(line.get("confidence", "low")).lower().strip()
         line["confidence"] = confidence if confidence in CONFIDENCE_VALUES else "low"
         line.setdefault("status", "unreviewed")
+        # Prüfstatus je Box explizit festhalten (Altbestand ohne "review":
+        # automatisch bestätigte Zeilen gelten als akzeptiert, siehe review.py).
+        line["review"] = review.review_state(line)
         # "rotation" war der Feldname der alten 90°-Schritt-Variante dieses
         # Features; bereits gespeicherte Werte werden beim Laden übernommen.
         if "angle" not in line and "rotation" in line:
@@ -464,6 +471,14 @@ BBOX_STYLE = """
 .bbox-text { position: absolute; z-index: 20; min-width: 220px; max-width: 420px; }
 .bbox-tip { display: none; position: absolute; left: 0; top: calc(100% + 22px); z-index: 40; background: rgba(25,25,25,.94); color: #fff; font: 13px/1.45 sans-serif; padding: 5px 8px; border-radius: 5px; width: max-content; max-width: 460px; white-space: normal; box-shadow: 0 2px 8px rgba(0,0,0,.35); pointer-events: none; }
 .bbox-box:hover { z-index: 30; }
+.bbox-review-accepted { background: rgba(36,161,72,.13); }
+.bbox-review-rejected { background: rgba(218,30,40,.13); border-style: dashed !important; }
+.bbox-review { position: absolute; top: -30px; right: -2px; display: flex; gap: 3px; }
+.bbox-review-btn { width: 22px; height: 20px; line-height: 18px; text-align: center; font-size: 13px; font-weight: bold; border-radius: 4px; cursor: pointer; user-select: none; background: white; box-shadow: 0 1px 3px rgba(0,0,0,.35); }
+.bbox-review-ok { color: #24A148; border: 1px solid #24A148; }
+.bbox-review-no { color: #DA1E28; border: 1px solid #DA1E28; }
+.bbox-review-ok.on { background: #24A148; color: white; }
+.bbox-review-no.on { background: #DA1E28; color: white; }
 .bbox-box:hover .bbox-tip { display: block; }
 .bbox-textarea { width: 100%; min-height: 60px; font-size: 14px; padding: 6px; border: 2px solid #0067C0; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.25); resize: vertical; font-family: inherit; box-sizing: border-box; }
 .bbox-empty { padding: 40px; text-align: center; color: #888; }
@@ -480,6 +495,9 @@ BBOX_STYLE = """
 .file-label { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-badge { flex-shrink: 0; font-weight: bold; color: #24A148; }
 .file-badge-pending { color: #F1C21B; }
+.file-row.partial { background: rgba(241, 194, 27, 0.16); }
+.file-row.partial:hover { background: rgba(241, 194, 27, 0.3); }
+.file-badge-partial { color: #8a6d00; font-size: 12px; }
 </style>
 """
 
@@ -669,6 +687,13 @@ BBOX_JS = """
     document.addEventListener('mouseup', onUp);
   };
 
+  window.qbReview = function(evt, id, value) {
+    evt.preventDefault();
+    evt.stopPropagation();
+    qbCommitActiveText();
+    qbSync({ type: 'review', id: id, value: value });
+  };
+
   window.qbCommitText = function(id) {
     const el = document.getElementById('textarea-' + id);
     if (!el) return;
@@ -715,12 +740,23 @@ def find_dataset_files(dataset_root: str) -> list[dict[str, Any]]:
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in DATASET_FILE_EXTENSIONS:
             continue
+        if MASKED_DIR in path.relative_to(root).parts:
+            continue  # abgedeckte Trainingskopien (Export), keine eigenen Scans
+        annotation_path = path.with_name(path.stem + "_annotation.json")
+        review_counts = None
+        if annotation_path.is_file():
+            try:
+                saved_lines = json.loads(annotation_path.read_text(encoding="utf-8")).get("lines", [])
+                review_counts = review.counts(saved_lines if isinstance(saved_lines, list) else [])
+            except (OSError, json.JSONDecodeError):
+                review_counts = None
         entries.append({
             "path": str(path.resolve()),
             "relative": path.relative_to(root).as_posix(),
             "is_pdf": path.suffix.lower() == ".pdf",
-            "annotated": path.with_name(path.stem + "_annotation.json").is_file(),
+            "annotated": annotation_path.is_file(),
             "preannotated": path.with_name(path.stem + "_preannotation.json").is_file(),
+            "review": review_counts,
         })
     entries.sort(key=lambda item: item["relative"].lower())
     return entries
@@ -756,9 +792,24 @@ def render_file_list(
     for entry in entries:
         classes = ["file-row"]
         badge = ""
-        if entry["annotated"]:
+        counts = entry.get("review")
+        open_count = counts[review.OPEN] if counts else 0
+        if entry["annotated"] and open_count:
+            # Gespeichert, aber noch nicht alle Boxen geprüft.
+            classes.append("partial")
+            done = counts[review.ACCEPTED] + counts[review.REJECTED]
+            total = done + open_count
+            badge = (
+                f"<span class='file-badge file-badge-partial' title='Teilweise geprüft: "
+                f"{counts[review.ACCEPTED]} akzeptiert, {counts[review.REJECTED]} nicht akzeptiert, "
+                f"{open_count} offen'>{done}/{total}</span>"
+            )
+        elif entry["annotated"]:
             classes.append("annotated")
-            badge = "<span class='file-badge' title='Annotiert / freigegeben'>&#10003;</span>"
+            title = "Alle Boxen geprüft"
+            if counts:
+                title += f": {counts[review.ACCEPTED]} akzeptiert, {counts[review.REJECTED]} nicht akzeptiert"
+            badge = f"<span class='file-badge' title='{title}'>&#10003;</span>"
         elif entry["preannotated"]:
             classes.append("preannotated")
             badge = "<span class='file-badge file-badge-pending' title='Vorannotiert, noch nicht geprüft'>&#8226;</span>"
@@ -831,8 +882,21 @@ def render_interactive_preview(
             color = CONFIDENCE_COLORS.get(line.get("confidence"), "#DA1E28")
         text = str(line.get("text_corrected", ""))
         angle = normalize_angle(line.get("angle", 0))
-        label = f"{index + 1}" if not angle else f"{index + 1} ↻{angle:g}°"
+        state = review.review_state(line)
+        mark = {review.ACCEPTED: "✓ ", review.REJECTED: "✗ "}.get(state, "")
+        label = f"{mark}{index + 1}" if not angle else f"{mark}{index + 1} ↻{angle:g}°"
         transform_style = f" transform: rotate({angle:.2f}deg);" if angle else ""
+        review_class = f" bbox-review-{state}"
+        review_buttons = (
+            f"<div class='bbox-review'>"
+            f"<div class='bbox-review-btn bbox-review-ok{' on' if state == review.ACCEPTED else ''}' "
+            f"title='Akzeptieren (nochmal klicken = offen)' "
+            f"onmousedown=\"window.qbReview(event,'{line_id}','{review.ACCEPTED}')\">✓</div>"
+            f"<div class='bbox-review-btn bbox-review-no{' on' if state == review.REJECTED else ''}' "
+            f"title='Nicht akzeptieren - geht nicht ins Training (nochmal klicken = offen)' "
+            f"onmousedown=\"window.qbReview(event,'{line_id}','{review.REJECTED}')\">✗</div>"
+            f"</div>"
+        )
 
         handles = "".join(
             f"<div class='bbox-handle bbox-handle-{corner}' "
@@ -867,9 +931,14 @@ def render_interactive_preview(
                 extra = (
                     f"<br><span style='color:#bbb'>Modell: {escape_html(predicted)}</span>"
                 )
+            state_text = {
+                review.ACCEPTED: "<span style='color:#7ee2a0'>✓ akzeptiert</span>",
+                review.REJECTED: "<span style='color:#ff8a8a'>✗ nicht akzeptiert</span>",
+                review.OPEN: "<span style='color:#bbb'>offen</span>",
+            }[state]
             hover_tip = (
                 f"<span class='bbox-tip'><b style='color:{color}'>{index + 1}</b> "
-                f"<span style='color:#fff'>{escape_html(shown)}</span>{extra}</span>"
+                f"<span style='color:#fff'>{escape_html(shown)}</span>{extra}<br>{state_text}</span>"
             )
         if active_text_id == line_id:
             # Unten an der tatsaechlichen (ggf. gedrehten) Box ausrichten,
@@ -889,7 +958,7 @@ def render_interactive_preview(
             )
 
         parts.append(
-            f"<div class='bbox-box' id='box-{line_id}' "
+            f"<div class='bbox-box{review_class}' id='box-{line_id}' "
             f"style='left:{left:.3f}%; top:{top:.3f}%; width:{box_width:.3f}%; height:{box_height:.3f}%; border-color:{color};{transform_style}' "
             f"onmousedown=\"window.qbStartDrag(event,'{line_id}')\">"
             f"<span class='bbox-label' style='background:{color};'>{label}</span>"
@@ -898,6 +967,7 @@ def render_interactive_preview(
             f"{rotate_handle}"
             f"{nudge_buttons}"
             f"{apply_last_angle_button}"
+            f"{review_buttons}"
             f"</div>"
             f"{text_panel}"
         )
@@ -973,7 +1043,10 @@ def crop_line(image_path: str, annotation: dict[str, Any], selected: int) -> Ima
 
 def annotation_to_table(annotation: dict[str, Any]) -> list[list[Any]]:
     return [
-        [line["id"], line["text_corrected"], line["confidence"], *line["bbox_pixels"], normalize_angle(line.get("angle", 0))]
+        [
+            line["id"], line["text_corrected"], line["confidence"], *line["bbox_pixels"],
+            normalize_angle(line.get("angle", 0)), review.LABELS[review.review_state(line)],
+        ]
         for line in annotation.get("lines", [])
     ]
 
@@ -1028,6 +1101,8 @@ def table_to_annotation(table: Any, annotation: dict[str, Any], image_path: str 
 
         pixel_box = validate_pixel_bbox(list(row[3:7]), width, height)
         angle = normalize_angle(row[7]) if len(row) > 7 else normalize_angle(previous.get("angle", 0))
+        previous_review = review.review_state(previous) if previous else review.OPEN
+        review_value = review.parse_label(row[8], previous_review) if len(row) > 8 else previous_review
         updated = copy.deepcopy(previous)
         updated.update({
             "id": str(row[0] or f"line_{index + 1:04d}"),
@@ -1037,6 +1112,7 @@ def table_to_annotation(table: Any, annotation: dict[str, Any], image_path: str 
             "text_corrected": corrected,
             "confidence": confidence,
             "status": "corrected" if corrected != predicted else "confirmed",
+            "review": review_value,
             "angle": angle,
         })
         lines.append(updated)
@@ -1573,6 +1649,7 @@ def add_box(table: Any, annotation: dict[str, Any], image_path: str):
         "text_corrected": "",
         "confidence": "low",
         "status": "unreviewed",
+        "review": review.OPEN,
         "angle": 0.0,
     }
     lines = lines + [new_line]
@@ -1614,6 +1691,70 @@ def delete_box(table: Any, annotation: dict[str, Any], image_path: str, selected
         new_selected,
         None,
         f"{removed_id} gelöscht.",
+    )
+
+
+def set_review(value: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    """Setzt den Prüfstatus der ausgewählten Zeile (Knöpfe unter der Vorschau)
+    und springt danach zur nächsten noch offenen Zeile."""
+    if not image_path:
+        raise gr.Error("Kein Bild geladen.")
+    try:
+        annotation = table_to_annotation(table, annotation, image_path)
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+    lines = annotation.get("lines", [])
+    index = int(selected)
+    if index < 0 or index >= len(lines):
+        raise gr.Error("Bitte zuerst eine Zeile auswählen (Tabellenzeile oder Box anklicken).")
+    lines[index]["review"] = value
+    annotation["lines"] = lines
+    # Weiter zur nächsten offenen Zeile (zügiges Durchprüfen), sonst stehen bleiben.
+    order = list(range(index + 1, len(lines))) + list(range(0, index))
+    new_selected = next((i for i in order if review.review_state(lines[i]) == review.OPEN), index)
+    word = "akzeptiert" if value == review.ACCEPTED else "nicht akzeptiert" if value == review.REJECTED else "offen"
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, new_selected, None),
+        crop_line(image_path, annotation, new_selected),
+        annotation_to_table(annotation),
+        new_selected,
+        None,
+        f"Zeile {index + 1} {word}. {review.summary(lines)}",
+    )
+
+
+def accept_selected(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    return set_review(review.ACCEPTED, table, annotation, image_path, selected)
+
+
+def reject_selected(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    return set_review(review.REJECTED, table, annotation, image_path, selected)
+
+
+def accept_all_open(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    if not image_path:
+        raise gr.Error("Kein Bild geladen.")
+    try:
+        annotation = table_to_annotation(table, annotation, image_path)
+    except Exception as exc:
+        raise gr.Error(str(exc)) from exc
+    lines = annotation.get("lines", [])
+    changed = 0
+    for line in lines:
+        if review.review_state(line) == review.OPEN:
+            line["review"] = review.ACCEPTED
+            changed += 1
+    annotation["lines"] = lines
+    selected = int(selected) if 0 <= int(selected) < len(lines) else (0 if lines else -1)
+    return (
+        annotation,
+        render_interactive_preview(image_path, annotation, selected, None),
+        crop_line(image_path, annotation, selected),
+        annotation_to_table(annotation),
+        selected,
+        None,
+        f"{changed} offene Zeile(n) akzeptiert. {review.summary(lines)}",
     )
 
 
@@ -1708,6 +1849,9 @@ def mark_no_text(table: Any, annotation: dict[str, Any], image_path: str):
         "text_corrected": "",
         "confidence": "low",
         "status": NO_TEXT_STATUS,
+        # Bewusst als leer geprüft: zählt als erledigt (geht mangels Text
+        # ohnehin nicht ins Training).
+        "review": review.ACCEPTED,
         "angle": 0.0,
         "source": "manual",
     }
@@ -1860,6 +2004,15 @@ def sync_bbox_edit(
             status,
             last_angle,
         )
+    elif action == "review":
+        value = payload.get("value")
+        if value not in review.STATES:
+            raise gr.Error("Ungültiger Prüfstatus.")
+        current = review.review_state(lines[index])
+        lines[index]["review"] = review.OPEN if current == value else value
+        selected = index
+        state_name = {review.ACCEPTED: "akzeptiert", review.REJECTED: "nicht akzeptiert", review.OPEN: "offen"}
+        status = f"Zeile {index + 1}: {state_name[lines[index]['review']]}. {review.summary(lines)}"
     elif action == "rotate":
         angle = normalize_angle(payload.get("angle", 0))
         lines[index]["angle"] = angle
@@ -1961,7 +2114,14 @@ def save_annotation(table: Any, annotation: dict[str, Any], image_path: str, mod
         output.write_text(json.dumps(annotation, ensure_ascii=False, indent=2), encoding="utf-8")
         all_html, flagged_html = render_file_lists(dataset_root, image_path)
         rotation_note = (" (Bilddatei physisch gedreht)" if pending_rotation else "") + runs_note
-        return annotation, str(output), f"Annotation gespeichert: {output}{rotation_note}", image_path, all_html, flagged_html
+        return (
+            annotation,
+            str(output),
+            f"Annotation gespeichert: {output}{rotation_note} | {review.summary(annotation.get('lines', []))}",
+            image_path,
+            all_html,
+            flagged_html,
+        )
     except Exception as exc:
         raise gr.Error(f"Speichern fehlgeschlagen: {exc}") from exc
 
@@ -1977,11 +2137,14 @@ def relative_image_path(image_path: str, dataset_root: str) -> str:
 
 
 def training_answer(annotation: dict[str, Any]) -> dict[str, Any]:
+    """Zielantwort fürs Training: nur akzeptierte Zeilen mit Text (siehe
+    review.py). Nicht akzeptierte und offene Zeilen werden stattdessen im
+    Trainingsbild abgedeckt (training_image)."""
     lines = []
     for line in annotation.get("lines", []):
-        text = str(line.get("text_corrected", "")).strip()
-        if not text:
+        if not review.is_training_line(line):
             continue
+        text = str(line.get("text_corrected", line.get("text", ""))).strip()
         entry = {"bbox_1000": validate_bbox(line["bbox_1000"]), "text": text}
         # "angle" nur bei spürbar gedrehten Zeilen mit ausgeben (siehe
         # rotate_box/PREANNOTATION_PROMPT/TRAINING_PROMPT) - hält das
@@ -1995,14 +2158,97 @@ def training_answer(annotation: dict[str, Any]) -> dict[str, Any]:
     return {"lines": lines}
 
 
-def training_record(annotation: dict[str, Any], image_path: str, dataset_root: str) -> dict[str, Any]:
+MASKED_DIR = "_training_masked"
+MASK_MARGIN_PX = 4
+PARTIAL_MODES = ("mask", "skip")
+
+
+def _rotated_corners(box: list[float], angle: float, margin: float = 0.0) -> list[tuple[float, float]]:
+    """Eckpunkte einer um ihren Mittelpunkt im Uhrzeigersinn gedrehten Box
+    (Bildkoordinaten, y nach unten - wie CSS rotate() in der Vorschau)."""
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+    hw, hh = (x2 - x1) / 2 + margin, (y2 - y1) / 2 + margin
+    rad = math.radians(angle)
+    cos_a, sin_a = math.cos(rad), math.sin(rad)
+    return [
+        (cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a)
+        for dx, dy in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))
+    ]
+
+
+def training_image(annotation: dict[str, Any], image_path: str, dataset_root: str) -> tuple[str, int]:
+    """Bild für den Trainingsdatensatz. Gibt es Zeilen, die nicht ins
+    Training gehen (nicht akzeptiert oder offen), wird eine Kopie erzeugt, in
+    der diese Bereiche mit der Hintergrundfarbe abgedeckt sind - sonst würde
+    das Modell lernen, sichtbare Zeilen wegzulassen. Akzeptierte Zeilen, die
+    von einer abgedeckten Box überlappt werden, werden danach wiederhergestellt.
+    Das Original bleibt unverändert; die Kopie liegt unter
+    <Dataset-Wurzel>/_training_masked/<gleicher Unterordner>/<name>_masked.png.
+    Liefert (Bildpfad, Anzahl abgedeckter Zeilen)."""
+    lines = [line for line in annotation.get("lines", []) if isinstance(line, dict) and line.get("bbox_pixels")]
+    excluded = [line for line in lines if review.is_excluded_region(line)]
+    if not excluded:
+        return image_path, 0
+    image = open_scan(image_path)
+    fill = tuple(int(v) for v in ImageStat.Stat(image).median)
+    masked = image.copy()
+    draw = ImageDraw.Draw(masked)
+    for line in excluded:
+        draw.polygon(_rotated_corners(line["bbox_pixels"], normalize_angle(line.get("angle", 0)), MASK_MARGIN_PX), fill=fill)
+    for line in lines:
+        if not review.is_training_line(line):
+            continue
+        x1, y1, x2, y2 = line["bbox_pixels"]
+        bx1, by1, bx2, by2 = rotated_box_bounds((x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1, normalize_angle(line.get("angle", 0)))
+        region = (
+            max(0, int(bx1)), max(0, int(by1)),
+            min(image.width, int(math.ceil(bx2))), min(image.height, int(math.ceil(by2))),
+        )
+        if region[2] > region[0] and region[3] > region[1]:
+            masked.paste(image.crop(region), region[:2])
+
+    root = Path(dataset_root).resolve() if dataset_root and dataset_root.strip() else Path(image_path).resolve().parent
+    relative = Path(relative_image_path(image_path, dataset_root))
+    sub_dir = relative.parent if not relative.is_absolute() else Path()
+    target = root / MASKED_DIR / sub_dir / f"{Path(image_path).stem}_masked.png"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    masked.save(target)
+    return str(target), len(excluded)
+
+
+def record_key(record: dict[str, Any]) -> str:
+    """Vergleichsschlüssel einer JSONL-Zeile: Bildpfad ohne Endung, bei
+    abgedeckten Kopien auf das Original zurückgeführt - damit ein erneuter
+    Export derselben Seite den alten Datensatz ersetzt, egal ob das Bild
+    zwischendurch abgedeckt war oder nicht."""
+    image = (record_image(record) or "").replace("\\", "/")
+    parts = PurePosixPath(image).parts
+    if MASKED_DIR in parts:
+        parts = parts[parts.index(MASKED_DIR) + 1 :]
+    path = PurePosixPath(*parts) if parts else PurePosixPath(image)
+    stem = path.stem[: -len("_masked")] if path.stem.endswith("_masked") and MASKED_DIR in image else path.stem
+    return str(path.with_name(stem))
+
+
+def build_training_record(
+    annotation: dict[str, Any], image_path: str, dataset_root: str, partial: str = "mask"
+) -> tuple[dict[str, Any], dict[str, int]]:
+    """Trainingsdatensatz einer Seite. partial bestimmt den Umgang mit nicht
+    vollständig geprüften Seiten: "mask" (Standard) deckt nicht akzeptierte
+    und offene Zeilen im Bild ab, "skip" lässt solche Seiten ganz weg."""
     answer = training_answer(annotation)
+    counts = review.counts(annotation.get("lines", []))
     if not answer["lines"]:
-        raise ValueError("Keine Zeilen mit korrigiertem Text vorhanden.")
-    return {
+        raise ValueError(f"Keine akzeptierten Zeilen mit Text ({review.summary(annotation.get('lines', []))}).")
+    excluded = sum(1 for line in annotation.get("lines", []) if isinstance(line, dict) and review.is_excluded_region(line))
+    if partial == "skip" and excluded:
+        raise ValueError(f"Nicht vollständig akzeptiert ({review.summary(annotation.get('lines', []))}).")
+    image_for_training, masked = training_image(annotation, image_path, dataset_root) if excluded else (image_path, 0)
+    record = {
         "messages": [
             {"role": "user", "content": [
-                {"type": "image", "image": relative_image_path(image_path, dataset_root)},
+                {"type": "image", "image": relative_image_path(image_for_training, dataset_root)},
                 {"type": "text", "text": TRAINING_PROMPT},
             ]},
             {"role": "assistant", "content": [
@@ -2010,6 +2256,11 @@ def training_record(annotation: dict[str, Any], image_path: str, dataset_root: s
             ]},
         ]
     }
+    return record, {"lines": len(answer["lines"]), "masked": masked, **counts}
+
+
+def training_record(annotation: dict[str, Any], image_path: str, dataset_root: str, partial: str = "mask") -> dict[str, Any]:
+    return build_training_record(annotation, image_path, dataset_root, partial)[0]
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -2047,20 +2298,26 @@ def export_jsonl(table: Any, annotation: dict[str, Any], image_path: str, datase
                 "Bilddatei stimmt sonst nicht mit den Box-Koordinaten überein. "
                 "Bitte zuerst 'Annotations-JSON speichern' klicken."
             )
-        record = training_record(annotation, image_path, dataset_root)
+        record, info = build_training_record(annotation, image_path, dataset_root, "mask")
         root = Path(dataset_root).resolve() if dataset_root.strip() else Path(image_path).resolve().parent
         root.mkdir(parents=True, exist_ok=True)
         output = root / "train.jsonl"
         records = [] if mode == "Datei ersetzen" else read_jsonl(output)
-        image_key = record_image(record)
-        records = [item for item in records if record_image(item) != image_key]
+        image_key = record_key(record)
+        records = [item for item in records if record_key(item) != image_key]
         records.append(record)
         output.write_text(
             "".join(json.dumps(x, ensure_ascii=False, separators=(",", ":")) + "\n" for x in records),
             encoding="utf-8",
             newline="\n",
         )
-        return annotation, str(output), f"JSONL exportiert: {output} | {len(records)} Datensätze, aktuelle Seite {len(training_answer(annotation)['lines'])} Zeilen.", image_path
+        masked_note = f", {info['masked']} nicht akzeptierte/offene Zeile(n) im Trainingsbild abgedeckt" if info["masked"] else ""
+        return (
+            annotation,
+            str(output),
+            f"JSONL exportiert: {output} | {len(records)} Datensätze, aktuelle Seite {info['lines']} akzeptierte Zeilen{masked_note}.",
+            image_path,
+        )
     except Exception as exc:
         raise gr.Error(f"JSONL-Export fehlgeschlagen: {exc}") from exc
 
@@ -2258,8 +2515,9 @@ def build_compare_tab(dataset_root: gr.Textbox):
     gr.Markdown(
         "Vergleicht Modelle auf bereits **geprüften** Seiten (`*_annotation.json` unter dem "
         "Dataset-Wurzelverzeichnis aus dem Reiter *Annotation*). Jeder Modelllauf wird in der "
-        "geprüften Datei unter `model_runs` gespeichert; die geprüften Zeilen bleiben unverändert "
-        "und dienen als Referenz.\n\n"
+        "geprüften Datei unter `model_runs` gespeichert; die geprüften Zeilen bleiben unverändert. "
+        "Referenz sind nur **akzeptierte** Zeilen (✓); nicht akzeptierte und offene Zeilen werden "
+        "ausgeklammert (grau) und nicht bewertet.\n\n"
         "- **CER/WER Seite**: Zeichen-/Wortfehlerrate über den ganzen Seitentext in Leserichtung - "
         "unabhängig davon, wie das Modell Zeilen in Boxen aufteilt. Unsicherheitsmarker `[?]` werden ignoriert.\n"
         "- **Zeilen-Recall/-Precision/F1, Ø IoU**: Boxen werden 1:1 über ihre Überlappung (IoU ≥ Schwelle) "
@@ -2361,7 +2619,7 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
         with gr.Tabs(selected=initial_tab):
             with gr.Tab("Annotation", id="annotation"):
                 gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; der kleine Griff über einer Box dreht sie frei (z.B. für eine schräg geschriebene Zeile); ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
-                with gr.Accordion("Dateien im Dataset (Bilder & PDFs, inkl. Unterordner) - annotierte/freigegebene Dateien grün", open=True):
+                with gr.Accordion("Dateien im Dataset (Bilder & PDFs, inkl. Unterordner) - grün = alle Boxen geprüft, gelb mit Zähler = teilweise geprüft", open=True):
                     with gr.Row():
                         with gr.Column():
                             gr.Markdown("**Alle Dateien**")
@@ -2437,7 +2695,11 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                         with gr.Row():
                             rotate_box_left_button = gr.Button("↺ Box -5°")
                             rotate_box_right_button = gr.Button("↻ Box +5°")
-                        table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number", "number"], column_count=(8, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
+                        with gr.Row():
+                            accept_button = gr.Button("✓ Zeile akzeptieren", variant="primary")
+                            reject_button = gr.Button("✗ Zeile nicht akzeptieren", variant="stop")
+                            accept_all_button = gr.Button("Alle offenen akzeptieren")
+                        table = gr.Dataframe(headers=TABLE_HEADERS, datatype=TABLE_DATATYPES, column_count=(len(TABLE_HEADERS), "fixed"), column_widths=TABLE_COLUMN_WIDTHS, label="Text und Pixelboxen korrigieren (Spalte \"Prüfung\": ✓ ok / ✗ nein / offen - auch ok/x tippbar)", interactive=True, wrap=True)
                 with gr.Row():
                     refresh_button = gr.Button("Änderungen übernehmen")
                     save_button = gr.Button("Annotations-JSON speichern")
@@ -2525,6 +2787,16 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
             [table, annotation_state, image_state],
             [annotation_state, preview, crop, table, selected_state, active_text_state, status],
         )
+        for review_button, review_fn in (
+            (accept_button, accept_selected),
+            (reject_button, reject_selected),
+            (accept_all_button, accept_all_open),
+        ):
+            review_button.click(
+                review_fn,
+                [table, annotation_state, image_state, selected_state],
+                [annotation_state, preview, crop, table, selected_state, active_text_state, status],
+            )
         rotate_box_left_button.click(
             rotate_box_left,
             [table, annotation_state, image_state, selected_state],

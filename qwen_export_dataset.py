@@ -6,6 +6,12 @@ Nur *_annotation.json zählt als geprüft: diese Dateien schreibt ausschließlic
 qwen_annotation_gui.py per "Annotations-JSON speichern", nachdem ein Mensch die
 Vorannotation kontrolliert hat. *_preannotation.json (ungeprüfte Modellausgabe von
 qwen_preannotate.py) wird bewusst ignoriert.
+
+Innerhalb einer Seite gehen nur Zeilen ins Training, die in der Oberfläche einzeln
+akzeptiert wurden (Prüfstatus je Box, siehe review.py). Nicht akzeptierte und noch
+offene Zeilen werden mit --partial mask (Standard) im Trainingsbild abgedeckt
+(Kopie unter <dataset-root>/_training_masked), mit --partial skip wird die ganze
+Seite weggelassen, solange nicht alle Zeilen akzeptiert sind.
 """
 
 from __future__ import annotations
@@ -24,22 +30,28 @@ def find_annotation_files(folder: Path) -> list[Path]:
     return sorted(folder.rglob("*_annotation.json"))
 
 
-def build_dataset(folder: Path, dataset_root: Path) -> tuple[list[dict[str, Any]], list[str]]:
+def build_dataset(
+    folder: Path, dataset_root: Path, partial: str = "mask"
+) -> tuple[list[dict[str, Any]], list[str], dict[str, int]]:
     records: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
+    stats = {"lines": 0, "masked": 0, "masked_pages": 0}
     for path in find_annotation_files(folder):
         try:
             annotation = json.loads(path.read_text(encoding="utf-8"))
             image_path = annotation.get("image", {}).get("file")
             if not image_path:
                 raise ValueError("Annotation enthält keinen Bildpfad (image.file).")
-            record = gui.training_record(annotation, image_path, str(dataset_root))
+            record, info = gui.build_training_record(annotation, image_path, str(dataset_root), partial)
         except Exception as error:
             warnings.append(f"{path}: {error}")
             continue
-        key = gui.record_image(record) or str(path)
+        key = gui.record_key(record) or str(path)
         records[key] = record
-    return list(records.values()), warnings
+        stats["lines"] += info["lines"]
+        stats["masked"] += info["masked"]
+        stats["masked_pages"] += 1 if info["masked"] else 0
+    return list(records.values()), warnings, stats
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,6 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Wurzelverzeichnis für relative Bildpfade in der JSONL; Standard: <folder>",
     )
     parser.add_argument("--output", help="Ausgabedatei; Standard: <folder>/train.jsonl")
+    parser.add_argument(
+        "--partial",
+        choices=gui.PARTIAL_MODES,
+        default="mask",
+        help="Seiten mit nicht akzeptierten/offenen Zeilen: 'mask' (Standard) deckt diese Zeilen "
+        "im Trainingsbild ab, 'skip' lässt die Seite weg",
+    )
     return parser
 
 
@@ -64,7 +83,7 @@ def main() -> None:
     dataset_root = Path(args.dataset_root).resolve() if args.dataset_root else folder
     output = Path(args.output).resolve() if args.output else folder / "train.jsonl"
 
-    records, warnings = build_dataset(folder, dataset_root)
+    records, warnings, stats = build_dataset(folder, dataset_root, args.partial)
     for warning in warnings:
         tprint(f"Übersprungen: {warning}", file=sys.stderr)
     if not records:
@@ -76,6 +95,10 @@ def main() -> None:
         newline="\n",
     )
     tprint(f"Geschrieben: {output} ({len(records)} Datensätze, {len(warnings)} übersprungen)")
+    tprint(
+        f"Akzeptierte Zeilen: {stats['lines']}; abgedeckt: {stats['masked']} Zeile(n) auf "
+        f"{stats['masked_pages']} Seite(n) (Bilder unter {dataset_root / gui.MASKED_DIR})"
+    )
 
 
 if __name__ == "__main__":

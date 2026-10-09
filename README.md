@@ -222,6 +222,31 @@ Ordner nicht zulässig, da die Namen je Datei automatisch vergeben werden. Ein F
 einer Datei bricht den Ordnerlauf nicht ab; die Datei wird mit Fehlermeldung übersprungen
 und mit den restlichen Dateien fortgefahren.
 
+## Prüfung je Box (akzeptieren / nicht akzeptieren)
+
+Geprüft wird nicht mehr die ganze Datei, sondern jede Box einzeln. Jede Zeile hat einen
+Prüfstatus: **✓ akzeptiert**, **✗ nicht akzeptiert** oder **offen** (Standard für neue
+Vorannotationen).
+
+- Vorschau: die kleinen Knöpfe ✓ / ✗ oben rechts an jeder Box (nochmal klicken = wieder
+  offen). Akzeptierte Boxen sind grün, nicht akzeptierte rot gestrichelt hinterlegt.
+- Tabelle: Spalte "Prüfung" (`✓ ok` / `✗ nein` / `offen`, von Hand auch `ok`, `x`,
+  `ja`, `nein` tippbar) sowie die Knöpfe "✓ Zeile akzeptieren", "✗ Zeile nicht
+  akzeptieren" (springen zur nächsten offenen Zeile) und "Alle offenen akzeptieren".
+- Dateiliste: grün = alle Boxen geprüft, gelb mit Zähler (z.B. `2/3`) = teilweise geprüft.
+
+Gespeichert wird der Status je Zeile als `review` in der `_annotation.json`. Ältere
+Annotationen ohne dieses Feld gelten weiter als vollständig akzeptiert.
+
+**Export fürs Training:** Nur akzeptierte Zeilen mit Text gehen in die Zielantwort.
+Nicht akzeptierte und offene Zeilen werden im Trainingsbild mit der Hintergrundfarbe
+abgedeckt, damit das Modell nicht lernt, sichtbare Zeilen wegzulassen. Dafür entsteht
+eine Kopie unter `<Dataset-Wurzel>\_training_masked\...\<name>_masked.png`; die
+Originalscans bleiben unverändert. `qwen_export_dataset.py --partial skip` lässt
+stattdessen jede Seite weg, die noch nicht vollständig akzeptiert ist. Der
+Modellvergleich bewertet ebenfalls nur gegen akzeptierte Zeilen; Bereiche nicht
+akzeptierter/offener Zeilen werden ausgeklammert (grau).
+
 ## Vorannotationen mehrerer Modelle
 
 Jede Vorannotation wird je Modell gespeichert, sowohl aus der Oberfläche als auch aus
