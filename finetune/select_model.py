@@ -37,6 +37,25 @@ QWEN3_VL = {
     "32b": ("Qwen/Qwen3-VL-32B", 32),
     "235b": ("Qwen/Qwen3-VL-235B-A22B", 235),
 }
+# Qwen3.5/3.6 sind nativ multimodal (kein eigenes "-VL"-Modell, kein
+# "-Instruct"-Suffix auf Hugging Face). Hybride Architektur (Gated DeltaNet +
+# Attention) - braucht ein aktuelles ms-swift/transformers im Trainings-Image.
+QWEN35 = {
+    "0.8b": ("Qwen/Qwen3.5-0.8B", 0.8),
+    "2b": ("Qwen/Qwen3.5-2B", 2),
+    "4b": ("Qwen/Qwen3.5-4B", 4),
+    "9b": ("Qwen/Qwen3.5-9B", 9),
+    "27b": ("Qwen/Qwen3.5-27B", 27),
+    "35b": ("Qwen/Qwen3.5-35B-A3B", 35),
+    "122b": ("Qwen/Qwen3.5-122B-A10B", 122),
+    "397b": ("Qwen/Qwen3.5-397B-A17B", 397),
+}
+QWEN36 = {
+    "27b": ("Qwen/Qwen3.6-27B", 27),
+    "35b": ("Qwen/Qwen3.6-35B-A3B", 35),
+}
+NEW_ARCH_NOTE = "neue Architektur, ggf. Image neu bauen"
+
 QWEN25_VL = {
     "3b": ("Qwen/Qwen2.5-VL-3B-Instruct", 3),
     "7b": ("Qwen/Qwen2.5-VL-7B-Instruct", 7),
@@ -72,6 +91,12 @@ def map_ollama_model(name: str) -> Candidate:
             base, params = QWEN3_VL[token]
             variant = "Thinking" if "thinking" in tag else "Instruct"
             return Candidate(name, f"{base}-{variant}", params)
+    for prefix, sizes, default in (("qwen3.5", QWEN35, "9b"), ("qwen3.6", QWEN36, "35b")):
+        if family == prefix:
+            token = size_token(tag, sizes) or (default if tag == "latest" else None)
+            if token:
+                hf, params = sizes[token]
+                return Candidate(name, hf, params, NEW_ARCH_NOTE)
     if family in ("qwen2.5vl", "qwen2.5-vl"):
         token = size_token(tag, QWEN25_VL) or ("7b" if tag == "latest" else None)
         if token:
@@ -156,7 +181,8 @@ def main() -> int:
             warn = f"  !! braucht ca. {need:.0f} GB, passt nicht in {vram:.0f} GB"
         elif need:
             warn = f"  (ca. {need:.0f} GB)"
-        print(f" {index:>2}. {c.hf_model:<34} <- {c.ollama_name}{warn}")
+        note = f"  [{c.note}]" if c.note else ""
+        print(f" {index:>2}. {c.hf_model:<34} <- {c.ollama_name}{warn}{note}")
     skipped = [c for c in candidates if not c.hf_model]
     if skipped:
         print()
@@ -198,7 +224,8 @@ def main() -> int:
     target.write_text(
         f"FT_MODEL={chosen.hf_model}\n"
         f"FT_OUTPUT_DIR_CONTAINER=/output/{slug}-handschrift\n"
-        f"FT_MODEL_SLUG={slug}\n",
+        f"FT_MODEL_SLUG={slug}\n"
+        f"FT_NEW_ARCH={1 if chosen.note == NEW_ARCH_NOTE else 0}\n",
         encoding="ascii",
     )
     print()

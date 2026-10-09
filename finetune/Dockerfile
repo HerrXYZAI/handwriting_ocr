@@ -20,8 +20,14 @@ RUN pip install torch --index-url https://download.pytorch.org/whl/cu124
 # ms-swift: SFT/LoRA/QLoRA framework with native Qwen3-VL support.
 # bitsandbytes: 4-bit quantization backend for QLoRA.
 # qwen-vl-utils: official Qwen helper for image preprocessing.
-RUN pip install \
+# PACKAGES_REFRESH: Ein neuer Wert (z.B. Datum/Uhrzeit) erzwingt, dass diese
+# Schicht neu gebaut wird und ms-swift/transformers in der aktuellen Version
+# installiert werden - nötig für neuere Modelle wie Qwen3.5/3.6. Torch und das
+# Basis-Image bleiben dabei im Zwischenspeicher.
+ARG PACKAGES_REFRESH=0
+RUN echo "Paketstand: ${PACKAGES_REFRESH}" && pip install --upgrade \
         "ms-swift[all]" \
+        transformers \
         bitsandbytes \
         accelerate \
         qwen-vl-utils \

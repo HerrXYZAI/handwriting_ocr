@@ -223,7 +223,18 @@ pushd finetune
 rem Image direkt mit "docker build" bauen statt per "docker compose up --build":
 rem Compose nutzt dafuer "buildx bake", das bei manchen Docker-Desktop-Versionen
 rem ohne Angabe von Gruenden mit "failed to execute bake" abbricht.
-docker build -t handschrift-ocr-finetune:latest .
+rem Fuer Qwen3.5/3.6 braucht das Image ein aktuelles ms-swift/transformers;
+rem PACKAGES_REFRESH mit neuem Wert baut nur die Paket-Schicht neu.
+set "FT_BUILD_ARGS="
+set "FT_REFRESH=n"
+if "!FT_NEW_ARCH!"=="1" (
+  echo.
+  echo !FT_MODEL! braucht ein aktuelles ms-swift im Trainings-Image.
+  set /p FT_REFRESH="Python-Pakete im Image jetzt aktualisieren? Dauert einige Minuten. (J/n): "
+  if "!FT_REFRESH!"=="" set "FT_REFRESH=j"
+)
+if /i "!FT_REFRESH!"=="j" set "FT_BUILD_ARGS=--build-arg PACKAGES_REFRESH=%RANDOM%%RANDOM%"
+docker build !FT_BUILD_ARGS! -t handschrift-ocr-finetune:latest .
 if errorlevel 1 (
   echo Bau des Trainings-Images fehlgeschlagen ^(siehe Meldungen oben^).
   popd
@@ -235,6 +246,7 @@ rem Auswahl nicht an spaetere Menuepunkte weiterreichen.
 set "FT_MODEL="
 set "FT_OUTPUT_DIR_CONTAINER="
 set "FT_MODEL_SLUG="
+set "FT_NEW_ARCH="
 goto :done
 
 :merge_adapter

@@ -4,6 +4,7 @@ import argparse
 import base64
 import copy
 import datetime
+import functools
 import io
 import json
 import math
@@ -110,11 +111,36 @@ def open_scan_for_display(image_path: str | Path, annotation: dict[str, Any]) ->
     gedrehten Box-Koordinaten passen. Die Datei selbst wird erst beim
     Speichern der Annotation tatsächlich gedreht.
     """
-    image = open_scan(image_path)
     rotation = int(annotation.get("image", {}).get("pending_rotation", 0)) % 360
+    return _cached_display(*_display_cache_key(image_path, rotation))[0]
+
+
+def display_data_uri(image_path: str | Path, annotation: dict[str, Any]) -> str:
+    """Verkleinertes Vorschaubild als data-URI, zwischengespeichert (siehe
+    _cached_display)."""
+    rotation = int(annotation.get("image", {}).get("pending_rotation", 0)) % 360
+    return _cached_display(*_display_cache_key(image_path, rotation))[1]
+
+
+def _display_cache_key(image_path: str | Path, rotation: int) -> tuple[str, int, int, int]:
+    path = Path(image_path).resolve()
+    stat = path.stat()
+    return str(path), stat.st_mtime_ns, stat.st_size, rotation
+
+
+@functools.lru_cache(maxsize=6)
+def _cached_display(path: str, mtime_ns: int, size: int, rotation: int) -> tuple[Image.Image, str]:
+    """Liest einen Scan nur einmal ein und hält ihn samt fertig kodiertem
+    Vorschaubild vor. Vorher wurde bei jedem Klick auf eine Box die komplette
+    Scan-Datei zweimal neu dekodiert, verkleinert und als JPEG kodiert, was die
+    Oberfläche spürbar einfrieren ließ. Änderungs-Zeitstempel und Größe im
+    Schlüssel sorgen dafür, dass ein physisch gedrehtes/neu gespeichertes Bild
+    neu eingelesen wird. Aufrufer dürfen das Bild nicht verändern (crop/rotate
+    liefern ohnehin neue Objekte)."""
+    image = open_scan(path)
     if rotation:
         image = image.rotate(-rotation, expand=True)
-    return image
+    return image, encode_display_image(image)
 
 
 def encode_image(path: Path) -> str:
@@ -436,6 +462,9 @@ BBOX_STYLE = """
 .bbox-nudge-plus { right: -26px; }
 .bbox-apply-angle { position: absolute; bottom: -20px; left: calc(50% - 15px); width: 30px; height: 16px; line-height: 12px; text-align: center; color: white; background: #24A148; border: 2px solid white; border-radius: 8px; cursor: pointer; font-size: 11px; font-weight: bold; box-shadow: 0 1px 3px rgba(0,0,0,.4); user-select: none; }
 .bbox-text { position: absolute; z-index: 20; min-width: 220px; max-width: 420px; }
+.bbox-tip { display: none; position: absolute; left: 0; top: calc(100% + 22px); z-index: 40; background: rgba(25,25,25,.94); color: #fff; font: 13px/1.45 sans-serif; padding: 5px 8px; border-radius: 5px; width: max-content; max-width: 460px; white-space: normal; box-shadow: 0 2px 8px rgba(0,0,0,.35); pointer-events: none; }
+.bbox-box:hover { z-index: 30; }
+.bbox-box:hover .bbox-tip { display: block; }
 .bbox-textarea { width: 100%; min-height: 60px; font-size: 14px; padding: 6px; border: 2px solid #0067C0; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.25); resize: vertical; font-family: inherit; box-sizing: border-box; }
 .bbox-empty { padding: 40px; text-align: center; color: #888; }
 #bbox-sync-box, #file-sync-box-all, #file-sync-box-flagged { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; opacity: 0 !important; pointer-events: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; }
@@ -643,6 +672,10 @@ BBOX_JS = """
   window.qbCommitText = function(id) {
     const el = document.getElementById('textarea-' + id);
     if (!el) return;
+    // Nur bei echter Änderung senden: sonst löst schon das Weiterklicken zur
+    // nächsten Box eine zusätzliche, unnötige Server-Runde (inkl. Neuaufbau
+    // der Tabelle) aus, bevor die neue Box geöffnet wird.
+    if (el.value === el.defaultValue) return;
     qbSync({ type: 'text', id: id, text: el.value });
   };
 
@@ -777,7 +810,7 @@ def render_interactive_preview(
         return EMPTY_PREVIEW_HTML
     image = open_scan_for_display(image_path, annotation)
     width, height = image.size
-    data_uri = encode_display_image(image)
+    data_uri = display_data_uri(image_path, annotation)
 
     parts = []
     for index, line in enumerate(annotation.get("lines", [])):
@@ -822,6 +855,22 @@ def render_interactive_preview(
         )
 
         text_panel = ""
+        # Mouse-over: erkannter/korrigierter Text der Box. Bei der gerade
+        # geöffneten Box nicht nötig, dort steht der Text im Eingabefeld.
+        # Textfarbe inline, da Gradio sonst dunklen Text erzwingt.
+        hover_tip = ""
+        if active_text_id != line_id:
+            shown = text if text else ("(kein sichtbarer Text)" if line.get("status") == NO_TEXT_STATUS else "(leer)")
+            predicted = str(line.get("text_predicted", ""))
+            extra = ""
+            if predicted and predicted != text:
+                extra = (
+                    f"<br><span style='color:#bbb'>Modell: {escape_html(predicted)}</span>"
+                )
+            hover_tip = (
+                f"<span class='bbox-tip'><b style='color:{color}'>{index + 1}</b> "
+                f"<span style='color:#fff'>{escape_html(shown)}</span>{extra}</span>"
+            )
         if active_text_id == line_id:
             # Unten an der tatsaechlichen (ggf. gedrehten) Box ausrichten,
             # nicht an ihrer ungedrehten bbox_pixels-Lage - sonst haengt das
@@ -844,6 +893,7 @@ def render_interactive_preview(
             f"style='left:{left:.3f}%; top:{top:.3f}%; width:{box_width:.3f}%; height:{box_height:.3f}%; border-color:{color};{transform_style}' "
             f"onmousedown=\"window.qbStartDrag(event,'{line_id}')\">"
             f"<span class='bbox-label' style='background:{color};'>{label}</span>"
+            f"{hover_tip}"
             f"{handles}"
             f"{rotate_handle}"
             f"{nudge_buttons}"
@@ -1798,6 +1848,18 @@ def sync_bbox_edit(
         active_text = None if active_text == line_id else line_id
         selected = index
         status = f"Zeile {index + 1} ausgewählt." if active_text else "Textfeld geschlossen."
+        # Reine Auswahl ändert keine Daten: Tabelle nicht neu übertragen und
+        # im Browser neu aufbauen (bei vielen Zeilen spürbar langsam).
+        return (
+            annotation,
+            render_interactive_preview(image_path, annotation, selected, active_text),
+            crop_line(image_path, annotation, selected),
+            gr.skip(),
+            selected,
+            active_text,
+            status,
+            last_angle,
+        )
     elif action == "rotate":
         angle = normalize_angle(payload.get("angle", 0))
         lines[index]["angle"] = angle
@@ -2481,6 +2543,9 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
             sync_bbox_edit,
             [bbox_sync, annotation_state, image_state, selected_state, active_text_state, last_angle_state],
             [annotation_state, preview, crop, table, selected_state, active_text_state, status, last_angle_state],
+            # Kein Ausgrauen/Ladebalken über Vorschau und Tabelle bei jedem
+            # Klick auf eine Box - das wirkte wie ein Einfrieren der Seite.
+            show_progress="hidden",
         )
         save_button.click(
             save_annotation,

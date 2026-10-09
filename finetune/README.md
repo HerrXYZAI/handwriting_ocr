@@ -41,6 +41,12 @@ und Punkt 10 ("Zurück nach Ollama") schlägt den Ollama-Namen passend zu diesem
 Ordner vor. Vor dem Start bietet run.bat außerdem an, im Docker-Container
 `ollama` geladene Modelle zu entladen.
 
+Qwen3.5/3.6 (z.B. `qwen3.5:9b` -> `Qwen/Qwen3.5-9B`) haben eine neue, hybride
+Architektur und brauchen ein aktuelles ms-swift/transformers. Bei Auswahl eines
+solchen Modells fragt run.bat, ob die Python-Pakete im Trainings-Image
+aktualisiert werden sollen (`--build-arg PACKAGES_REFRESH=...`, baut nur die
+Paket-Schicht neu). Das Training dieser Modelle ist noch wenig erprobt.
+
 ## 1. Dataset konvertieren
 
 `qwen_export_dataset.py` schreibt Bilder als eigenen Content-Block innerhalb
