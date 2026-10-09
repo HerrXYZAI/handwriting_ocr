@@ -232,7 +232,12 @@ Vorannotationen).
   Zeilenausschnitt korrigieren und **Enter** drücken - der Text wird übernommen, die
   Zeile akzeptiert und sofort die nächste Zeile geladen (Cursor steht wieder im Feld).
 - Vorschau: die kleinen Knöpfe ✓ / ✗ neben jeder Box (nochmal klicken = wieder offen).
-  Akzeptierte Boxen sind grün, nicht akzeptierte rot gestrichelt hinterlegt.
+  Farben: grau = offen (erkannt, noch nicht geprüft), grün = akzeptiert, rot gestrichelt =
+  nicht akzeptiert, blau = ausgewählt. Die Modell-Konfidenz steht im Mouse-over-Hinweis.
+  Der Schalter **"Akzeptierte Boxen ausblenden"** blendet erledigte Boxen aus; "akzeptieren"
+  springt dann zur nächsten noch nicht akzeptierten Zeile.
+- **"⏭ Überspringen"** (zwischen den beiden Knöpfen) lässt den Prüfstatus unverändert und
+  geht zur nächsten Zeile; eine bereits getippte Korrektur wird dabei übernommen.
 - Tabelle: Spalte "Prüfung" (`✓ ok` / `✗ nein` / `offen`, von Hand auch `ok`, `x`,
   `ja`, `nein` tippbar) sowie die Knöpfe "✓ Zeile akzeptieren", "✗ Zeile nicht
   akzeptieren" (übernehmen den Text aus dem Korrekturfeld und springen zur nächsten

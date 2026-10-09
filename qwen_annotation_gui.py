@@ -505,6 +505,8 @@ def line_to_pixels(
 
 CONFIDENCE_COLORS = {"high": "#24A148", "medium": "#F1C21B", "low": "#DA1E28"}
 SELECTED_COLOR = "#0067C0"
+REVIEW_COLORS = {review.ACCEPTED: "#24A148", review.REJECTED: "#DA1E28", review.OPEN: "#8D8D8D"}
+CONFIDENCE_NAMES = {"high": "hoch", "medium": "mittel", "low": "niedrig"}
 NO_TEXT_STATUS = "no_text"
 NO_TEXT_COLOR = "#8D8D8D"
 EMPTY_PREVIEW_HTML = "<div class='bbox-empty'>Kein Bild geladen.</div>"
@@ -531,6 +533,7 @@ BBOX_STYLE = """
 .bbox-box:hover { z-index: 30; }
 .bbox-review-accepted { background: rgba(36,161,72,.13); }
 .bbox-review-rejected { background: rgba(218,30,40,.13); border-style: dashed !important; }
+body.qb-hide-accepted .bbox-review-accepted:not(.bbox-selected) { display: none; }
 .bbox-review { position: absolute; top: calc(50% - 10px); left: calc(100% + 30px); display: flex; gap: 3px; }
 .bbox-review-left { left: auto; right: calc(100% + 30px); }
 .bbox-review-below { top: calc(100% + 4px); left: auto; right: 0; }
@@ -934,19 +937,21 @@ def render_interactive_preview(
         box_width = (x2 - x1) / width * 100
         box_height = (y2 - y1) / height * 100
         line_id = line.get("id") or f"line_{index + 1:04d}"
+        # Farbe nach Prüfstatus (grau = offen/erkannt, grün = akzeptiert,
+        # rot = nicht akzeptiert); die ausgewählte Box bleibt blau.
         if index == selected:
             color = SELECTED_COLOR
         elif line.get("status") == NO_TEXT_STATUS:
             color = NO_TEXT_COLOR
         else:
-            color = CONFIDENCE_COLORS.get(line.get("confidence"), "#DA1E28")
+            color = REVIEW_COLORS[review.review_state(line)]
         text = str(line.get("text_corrected", ""))
         angle = normalize_angle(line.get("angle", 0))
         state = review.review_state(line)
         mark = {review.ACCEPTED: "✓ ", review.REJECTED: "✗ "}.get(state, "")
         label = f"{mark}{index + 1}" if not angle else f"{mark}{index + 1} ↻{angle:g}°"
         transform_style = f" transform: rotate({angle:.2f}deg);" if angle else ""
-        review_class = f" bbox-review-{state}"
+        review_class = f" bbox-review-{state}" + (" bbox-selected" if index == selected else "")
         # Prüf-Knöpfe neben die Box (nicht darüber, sonst verdecken sie Text):
         # rechts, bei Boxen am rechten Rand links, bei Boxen über die ganze
         # Breite rechts unterhalb (Zeilenzwischenraum).
@@ -1007,7 +1012,8 @@ def render_interactive_preview(
             }[state]
             hover_tip = (
                 f"<span class='bbox-tip'><b style='color:{color}'>{index + 1}</b> "
-                f"<span style='color:#fff'>{escape_html(shown)}</span>{extra}<br>{state_text}</span>"
+                f"<span style='color:#fff'>{escape_html(shown)}</span>{extra}<br>{state_text}"
+                f"<span style='color:#bbb'> · Modell-Konfidenz {CONFIDENCE_NAMES.get(line.get('confidence'), '?')}</span></span>"
             )
         if active_text_id == line_id:
             # Unten an der tatsaechlichen (ggf. gedrehten) Box ausrichten,
@@ -1795,7 +1801,10 @@ def _apply_text(line: dict[str, Any], text: str | None) -> bool:
     return True
 
 
-def set_review(value: str, text: str | None, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+def set_review(
+    value: str | None, text: str | None, table: Any, annotation: dict[str, Any], image_path: str, selected: int,
+    hide_accepted: bool = False,
+):
     """Übernimmt den Text aus dem Korrekturfeld, setzt den Prüfstatus der
     ausgewählten Zeile und lädt sofort die nächste Zeile (Zeilenausschnitt,
     Korrekturfeld und Markierung in der Vorschau)."""
@@ -1810,14 +1819,19 @@ def set_review(value: str, text: str | None, table: Any, annotation: dict[str, A
     if index < 0 or index >= len(lines):
         raise gr.Error("Bitte zuerst eine Zeile auswählen (Tabellenzeile oder Box anklicken).")
     _apply_text(lines[index], text)
-    lines[index]["review"] = value
+    if value is not None:  # None = überspringen, Prüfstatus bleibt
+        lines[index]["review"] = value
     annotation["lines"] = lines
-    # Nächste Zeile in Reihenfolge; am Ende zur ersten noch offenen Zeile.
-    if index + 1 < len(lines):
-        new_selected = index + 1
+    # Nächste Zeile in Reihenfolge (bei ausgeblendeten akzeptierten Boxen die
+    # nächste nicht akzeptierte); am Ende zur ersten noch offenen Zeile.
+    later = range(index + 1, len(lines))
+    if hide_accepted:
+        new_selected = next((i for i in later if review.review_state(lines[i]) != review.ACCEPTED), None)
     else:
-        new_selected = next((i for i, line in enumerate(lines) if review.review_state(line) == review.OPEN), index)
-    word = "akzeptiert" if value == review.ACCEPTED else "nicht akzeptiert" if value == review.REJECTED else "offen"
+        new_selected = index + 1 if index + 1 < len(lines) else None
+    if new_selected is None:
+        new_selected = next((i for i, line in enumerate(lines) if review.review_state(line) == review.OPEN and i != index), index)
+    word = {review.ACCEPTED: "akzeptiert", review.REJECTED: "nicht akzeptiert", review.OPEN: "offen", None: "übersprungen"}[value]
     return (
         annotation,
         render_interactive_preview(image_path, annotation, new_selected, None),
@@ -1830,15 +1844,21 @@ def set_review(value: str, text: str | None, table: Any, annotation: dict[str, A
     )
 
 
-def accept_selected(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
-    return set_review(review.ACCEPTED, text, table, annotation, image_path, selected)
+def accept_selected(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int, hide_accepted: bool = False):
+    return set_review(review.ACCEPTED, text, table, annotation, image_path, selected, hide_accepted)
 
 
-def reject_selected(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
-    return set_review(review.REJECTED, text, table, annotation, image_path, selected)
+def reject_selected(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int, hide_accepted: bool = False):
+    return set_review(review.REJECTED, text, table, annotation, image_path, selected, hide_accepted)
 
 
-def accept_all_open(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+def skip_selected(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int, hide_accepted: bool = False):
+    """Überspringen: Prüfstatus unverändert lassen (bereits getippte Korrektur
+    wird trotzdem übernommen) und zur nächsten Zeile gehen."""
+    return set_review(None, text, table, annotation, image_path, selected, hide_accepted)
+
+
+def accept_all_open(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int, hide_accepted: bool = False):
     if not image_path:
         raise gr.Error("Kein Bild geladen.")
     try:
@@ -2791,6 +2811,11 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                             choices=[],
                             interactive=True,
                         )
+                        hide_accepted = gr.Checkbox(
+                            label="Akzeptierte Boxen ausblenden",
+                            info="Farben: grau = offen, grün = akzeptiert, rot = nicht akzeptiert, blau = ausgewählt.",
+                            value=False,
+                        )
                         preview = gr.HTML(EMPTY_PREVIEW_HTML, label="Zeilenboxen", elem_id="bbox-preview-wrap")
                         # visible=False would unmount this element in Gradio 6, breaking the
                         # JS->Python bridge from render_interactive_preview; hide via CSS instead
@@ -2807,6 +2832,7 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                         )
                         with gr.Row():
                             accept_button = gr.Button("✓ Zeile akzeptieren", variant="primary")
+                            skip_button = gr.Button("⏭ Überspringen")
                             reject_button = gr.Button("✗ Zeile nicht akzeptieren", variant="stop")
                             accept_all_button = gr.Button("Alle offenen akzeptieren")
                         with gr.Row():
@@ -2915,9 +2941,15 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
         # Tabellenzeile überschneiden und die Korrektur überschreiben).
         focus_line_text = "() => { setTimeout(() => { const t = document.querySelector('#line-text-box textarea, #line-text-box input'); if (t) { t.focus(); const n = t.value.length; t.setSelectionRange(n, n); } }, 150); }"
         review_outputs = [annotation_state, preview, crop, table, selected_state, active_text_state, status, line_text]
-        review_inputs = [line_text, table, annotation_state, image_state, selected_state]
+        review_inputs = [line_text, table, annotation_state, image_state, selected_state, hide_accepted]
+        # Ausblenden rein im Browser (CSS-Klasse am <body>), ohne Neuaufbau der Vorschau.
+        hide_accepted.change(
+            None, [hide_accepted], None,
+            js="(v) => { document.body.classList.toggle('qb-hide-accepted', !!v); return []; }",
+        )
         for review_button, review_fn in (
             (accept_button, accept_selected),
+            (skip_button, skip_selected),
             (reject_button, reject_selected),
             (accept_all_button, accept_all_open),
         ):
