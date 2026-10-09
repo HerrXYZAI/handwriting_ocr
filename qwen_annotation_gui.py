@@ -5,6 +5,7 @@ import base64
 import copy
 import datetime
 import functools
+import hashlib
 import io
 import json
 import math
@@ -12,7 +13,9 @@ import mimetypes
 import os
 import re
 import shutil
+import tempfile
 import time
+import urllib.parse
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -107,6 +110,22 @@ def open_scan(image_path: str | Path) -> Image.Image:
         return ImageOps.exif_transpose(source).convert("RGB")
 
 
+_EXIF_ORIENTATION = 0x0112
+
+
+def scan_size(image_path: str | Path) -> tuple[int, int]:
+    """Bildgröße wie open_scan(...).size (inkl. EXIF-Drehung), aber nur aus dem
+    Dateikopf gelesen - ohne den kompletten Scan zu dekodieren. Vorher kostete
+    allein das beim Speichern/Laden spürbar Zeit."""
+    with Image.open(image_path) as source:
+        width, height = source.size
+        try:
+            orientation = source.getexif().get(_EXIF_ORIENTATION, 1)
+        except Exception:
+            orientation = 1
+    return (height, width) if orientation in (5, 6, 7, 8) else (width, height)
+
+
 def open_scan_for_display(image_path: str | Path, annotation: dict[str, Any]) -> Image.Image:
     """Wie open_scan(), dreht das Bild aber zusätzlich um eine noch nicht auf
     die Datei angewendete Drehung (siehe rotate_page/annotation["image"]
@@ -118,11 +137,36 @@ def open_scan_for_display(image_path: str | Path, annotation: dict[str, Any]) ->
     return _cached_display(*_display_cache_key(image_path, rotation))[0]
 
 
+# Vorschaubilder werden einmal als Datei abgelegt und per URL eingebunden statt
+# als ~0,5 MB großer data-URI in jedes HTML-Update eingebettet. So muss der
+# Browser bei einem Klick auf eine Box/Tabellenzeile nur noch wenige KB neues
+# HTML verarbeiten; das Bild kommt aus seinem Zwischenspeicher.
+PREVIEW_DIR = Path(tempfile.gettempdir()) / "handschrift_ocr_preview"
+PREVIEW_URL_PREFIX = "/gradio_api/file="
+try:
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    gr.set_static_paths(paths=[str(PREVIEW_DIR)])
+    _PREVIEW_FILES_OK = True
+except Exception:  # z.B. ältere Gradio-Version - dann wie bisher data-URI
+    _PREVIEW_FILES_OK = False
+
+
+def _prune_preview_dir(max_age_days: float = 7) -> None:
+    cutoff = time.time() - max_age_days * 86400
+    try:
+        for old in PREVIEW_DIR.glob("*.jpg"):
+            if old.stat().st_mtime < cutoff:
+                old.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def display_data_uri(image_path: str | Path, annotation: dict[str, Any]) -> str:
-    """Verkleinertes Vorschaubild als data-URI, zwischengespeichert (siehe
-    _cached_display)."""
+    """Quelle (src) des verkleinerten Vorschaubilds: URL der zwischengespeicherten
+    Datei, ersatzweise data-URI (siehe _cached_display)."""
     rotation = int(annotation.get("image", {}).get("pending_rotation", 0)) % 360
-    return _cached_display(*_display_cache_key(image_path, rotation))[1]
+    _, data_uri, url = _cached_display(*_display_cache_key(image_path, rotation))
+    return url or data_uri
 
 
 def _display_cache_key(image_path: str | Path, rotation: int) -> tuple[str, int, int, int]:
@@ -132,7 +176,7 @@ def _display_cache_key(image_path: str | Path, rotation: int) -> tuple[str, int,
 
 
 @functools.lru_cache(maxsize=6)
-def _cached_display(path: str, mtime_ns: int, size: int, rotation: int) -> tuple[Image.Image, str]:
+def _cached_display(path: str, mtime_ns: int, size: int, rotation: int) -> tuple[Image.Image, str, str | None]:
     """Liest einen Scan nur einmal ein und hält ihn samt fertig kodiertem
     Vorschaubild vor. Vorher wurde bei jedem Klick auf eine Box die komplette
     Scan-Datei zweimal neu dekodiert, verkleinert und als JPEG kodiert, was die
@@ -143,7 +187,18 @@ def _cached_display(path: str, mtime_ns: int, size: int, rotation: int) -> tuple
     image = open_scan(path)
     if rotation:
         image = image.rotate(-rotation, expand=True)
-    return image, encode_display_image(image)
+    data_uri = encode_display_image(image)
+    url = None
+    if _PREVIEW_FILES_OK:
+        key = hashlib.sha1(f"{path}|{mtime_ns}|{size}|{rotation}".encode("utf-8")).hexdigest()[:20]
+        target = PREVIEW_DIR / f"{key}.jpg"
+        try:
+            if not target.is_file():
+                target.write_bytes(base64.b64decode(data_uri.split(",", 1)[1]))
+            url = PREVIEW_URL_PREFIX + urllib.parse.quote(target.resolve().as_posix(), safe="/:")
+        except OSError:
+            url = None
+    return image, data_uri, url
 
 
 def encode_image(path: Path) -> str:
@@ -257,8 +312,7 @@ def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
 def ensure_pixel_boxes(annotation: dict[str, Any], image_path: str) -> dict[str, Any]:
     """Macht bbox_pixels zur führenden, verlustfreien Koordinatenquelle."""
     result = copy.deepcopy(annotation)
-    image = open_scan(image_path)
-    width, height = image.size
+    width, height = scan_size(image_path)
 
     stored_image = result.get("image")
     if not isinstance(stored_image, dict):
@@ -473,7 +527,9 @@ BBOX_STYLE = """
 .bbox-box:hover { z-index: 30; }
 .bbox-review-accepted { background: rgba(36,161,72,.13); }
 .bbox-review-rejected { background: rgba(218,30,40,.13); border-style: dashed !important; }
-.bbox-review { position: absolute; top: -30px; right: -2px; display: flex; gap: 3px; }
+.bbox-review { position: absolute; top: calc(50% - 10px); left: calc(100% + 30px); display: flex; gap: 3px; }
+.bbox-review-left { left: auto; right: calc(100% + 30px); }
+.bbox-review-below { top: calc(100% + 4px); left: auto; right: 0; }
 .bbox-review-btn { width: 22px; height: 20px; line-height: 18px; text-align: center; font-size: 13px; font-weight: bold; border-radius: 4px; cursor: pointer; user-select: none; background: white; box-shadow: 0 1px 3px rgba(0,0,0,.35); }
 .bbox-review-ok { color: #24A148; border: 1px solid #24A148; }
 .bbox-review-no { color: #DA1E28; border: 1px solid #DA1E28; }
@@ -887,8 +943,17 @@ def render_interactive_preview(
         label = f"{mark}{index + 1}" if not angle else f"{mark}{index + 1} ↻{angle:g}°"
         transform_style = f" transform: rotate({angle:.2f}deg);" if angle else ""
         review_class = f" bbox-review-{state}"
+        # Prüf-Knöpfe neben die Box (nicht darüber, sonst verdecken sie Text):
+        # rechts, bei Boxen am rechten Rand links, bei Boxen über die ganze
+        # Breite rechts unterhalb (Zeilenzwischenraum).
+        if x2 / width <= 0.86:
+            review_side = ""
+        elif x1 / width >= 0.14:
+            review_side = " bbox-review-left"
+        else:
+            review_side = " bbox-review-below"
         review_buttons = (
-            f"<div class='bbox-review'>"
+            f"<div class='bbox-review{review_side}'>"
             f"<div class='bbox-review-btn bbox-review-ok{' on' if state == review.ACCEPTED else ''}' "
             f"title='Akzeptieren (nochmal klicken = offen)' "
             f"onmousedown=\"window.qbReview(event,'{line_id}','{review.ACCEPTED}')\">✓</div>"
@@ -1067,8 +1132,7 @@ def table_to_annotation(table: Any, annotation: dict[str, Any], image_path: str 
     width = int(image.get("width", 0))
     height = int(image.get("height", 0))
     if (width <= 0 or height <= 0) and image_path:
-        actual = open_scan(image_path)
-        width, height = actual.size
+        width, height = scan_size(image_path)
         result["image"] = {
             **image,
             "file": str(Path(image_path).resolve()),
@@ -1406,7 +1470,7 @@ def load_annotation_data(image_path: str, data: dict[str, Any], status_note: str
 
         stored_image = data.get("image")
         if isinstance(stored_image, dict) and stored_image.get("width") and stored_image.get("height"):
-            actual_width, actual_height = open_scan(image_path).size
+            actual_width, actual_height = scan_size(image_path)
             if (int(stored_image["width"]), int(stored_image["height"])) != (actual_width, actual_height):
                 raise ValueError(
                     "Diese Annotation wurde für ein Bild mit "
@@ -1694,9 +1758,43 @@ def delete_box(table: Any, annotation: dict[str, Any], image_path: str, selected
     )
 
 
-def set_review(value: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
-    """Setzt den Prüfstatus der ausgewählten Zeile (Knöpfe unter der Vorschau)
-    und springt danach zur nächsten noch offenen Zeile."""
+def selected_line_text(annotation: dict[str, Any], selected: int) -> str:
+    """Text der ausgewählten Zeile für das Korrekturfeld unter dem Zeilenausschnitt."""
+    lines = (annotation or {}).get("lines", [])
+    try:
+        index = int(selected)
+    except (TypeError, ValueError):
+        return ""
+    if 0 <= index < len(lines):
+        return str(lines[index].get("text_corrected", ""))
+    return ""
+
+
+def refresh_line_text(annotation: dict[str, Any], selected: int, current: str | None):
+    """Füllt das Korrekturfeld nach Auswahl-/Datenänderungen. Steht dort schon
+    der richtige Text, wird nichts gesendet - so wird nach "akzeptieren und
+    weiter" nichts überschrieben, was man in der nächsten Zeile bereits tippt."""
+    text = selected_line_text(annotation, selected)
+    return gr.skip() if text == (current or "") else text
+
+
+def _apply_text(line: dict[str, Any], text: str | None) -> bool:
+    """Übernimmt einen korrigierten Text in die Zeile; True, falls geändert."""
+    if text is None:
+        return False
+    corrected = str(text).strip()
+    if corrected == str(line.get("text_corrected", "")):
+        return False
+    line["text_corrected"] = corrected
+    predicted = line.get("text_predicted", corrected)
+    line["status"] = "corrected" if corrected != predicted else "confirmed"
+    return True
+
+
+def set_review(value: str, text: str | None, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    """Übernimmt den Text aus dem Korrekturfeld, setzt den Prüfstatus der
+    ausgewählten Zeile und lädt sofort die nächste Zeile (Zeilenausschnitt,
+    Korrekturfeld und Markierung in der Vorschau)."""
     if not image_path:
         raise gr.Error("Kein Bild geladen.")
     try:
@@ -1707,11 +1805,14 @@ def set_review(value: str, table: Any, annotation: dict[str, Any], image_path: s
     index = int(selected)
     if index < 0 or index >= len(lines):
         raise gr.Error("Bitte zuerst eine Zeile auswählen (Tabellenzeile oder Box anklicken).")
+    _apply_text(lines[index], text)
     lines[index]["review"] = value
     annotation["lines"] = lines
-    # Weiter zur nächsten offenen Zeile (zügiges Durchprüfen), sonst stehen bleiben.
-    order = list(range(index + 1, len(lines))) + list(range(0, index))
-    new_selected = next((i for i in order if review.review_state(lines[i]) == review.OPEN), index)
+    # Nächste Zeile in Reihenfolge; am Ende zur ersten noch offenen Zeile.
+    if index + 1 < len(lines):
+        new_selected = index + 1
+    else:
+        new_selected = next((i for i, line in enumerate(lines) if review.review_state(line) == review.OPEN), index)
     word = "akzeptiert" if value == review.ACCEPTED else "nicht akzeptiert" if value == review.REJECTED else "offen"
     return (
         annotation,
@@ -1720,19 +1821,20 @@ def set_review(value: str, table: Any, annotation: dict[str, Any], image_path: s
         annotation_to_table(annotation),
         new_selected,
         None,
-        f"Zeile {index + 1} {word}. {review.summary(lines)}",
+        f"Zeile {index + 1} {word}, weiter mit Zeile {new_selected + 1}. {review.summary(lines)}",
+        selected_line_text(annotation, new_selected),
     )
 
 
-def accept_selected(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
-    return set_review(review.ACCEPTED, table, annotation, image_path, selected)
+def accept_selected(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    return set_review(review.ACCEPTED, text, table, annotation, image_path, selected)
 
 
-def reject_selected(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
-    return set_review(review.REJECTED, table, annotation, image_path, selected)
+def reject_selected(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+    return set_review(review.REJECTED, text, table, annotation, image_path, selected)
 
 
-def accept_all_open(table: Any, annotation: dict[str, Any], image_path: str, selected: int):
+def accept_all_open(text: str, table: Any, annotation: dict[str, Any], image_path: str, selected: int):
     if not image_path:
         raise gr.Error("Kein Bild geladen.")
     try:
@@ -1740,13 +1842,15 @@ def accept_all_open(table: Any, annotation: dict[str, Any], image_path: str, sel
     except Exception as exc:
         raise gr.Error(str(exc)) from exc
     lines = annotation.get("lines", [])
+    selected = int(selected) if 0 <= int(selected) < len(lines) else (0 if lines else -1)
+    if selected >= 0:
+        _apply_text(lines[selected], text)
     changed = 0
     for line in lines:
         if review.review_state(line) == review.OPEN:
             line["review"] = review.ACCEPTED
             changed += 1
     annotation["lines"] = lines
-    selected = int(selected) if 0 <= int(selected) < len(lines) else (0 if lines else -1)
     return (
         annotation,
         render_interactive_preview(image_path, annotation, selected, None),
@@ -1755,6 +1859,7 @@ def accept_all_open(table: Any, annotation: dict[str, Any], image_path: str, sel
         selected,
         None,
         f"{changed} offene Zeile(n) akzeptiert. {review.summary(lines)}",
+        selected_line_text(annotation, selected),
     )
 
 
@@ -2688,6 +2793,18 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                         # so it stays queryable while a box is dragged/resized/edited.
                         bbox_sync = gr.Textbox(elem_id="bbox-sync-box", visible=True, container=False)
                         crop = gr.Image(label="Ausgewählte Zeile", type="pil", interactive=False, height=180)
+                        line_text = gr.Textbox(
+                            label="Text der ausgewählten Zeile",
+                            info="Korrigieren, dann Enter = übernehmen, akzeptieren und nächste Zeile. "
+                            "Übernommen wird der Text mit Enter oder den Knöpfen ✓/✗ direkt darunter.",
+                            lines=1,
+                            max_lines=4,
+                            elem_id="line-text-box",
+                        )
+                        with gr.Row():
+                            accept_button = gr.Button("✓ Zeile akzeptieren", variant="primary")
+                            reject_button = gr.Button("✗ Zeile nicht akzeptieren", variant="stop")
+                            accept_all_button = gr.Button("Alle offenen akzeptieren")
                         with gr.Row():
                             add_box_button = gr.Button("Box hinzufügen")
                             delete_box_button = gr.Button("Ausgewählte Box löschen")
@@ -2695,10 +2812,6 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                         with gr.Row():
                             rotate_box_left_button = gr.Button("↺ Box -5°")
                             rotate_box_right_button = gr.Button("↻ Box +5°")
-                        with gr.Row():
-                            accept_button = gr.Button("✓ Zeile akzeptieren", variant="primary")
-                            reject_button = gr.Button("✗ Zeile nicht akzeptieren", variant="stop")
-                            accept_all_button = gr.Button("Alle offenen akzeptieren")
                         table = gr.Dataframe(headers=TABLE_HEADERS, datatype=TABLE_DATATYPES, column_count=(len(TABLE_HEADERS), "fixed"), column_widths=TABLE_COLUMN_WIDTHS, label="Text und Pixelboxen korrigieren (Spalte \"Prüfung\": ✓ ok / ✗ nein / offen - auch ok/x tippbar)", interactive=True, wrap=True)
                 with gr.Row():
                     refresh_button = gr.Button("Änderungen übernehmen")
@@ -2760,7 +2873,12 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
             [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status],
         )
         load.click(load_annotation, [image, existing], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
-        table.select(select_row, [table, annotation_state, image_state], [annotation_state, preview, crop, selected_state, active_text_state, status])
+        table.select(
+            select_row,
+            [table, annotation_state, image_state],
+            [annotation_state, preview, crop, selected_state, active_text_state, status],
+            show_progress="hidden",
+        )
         refresh_button.click(refresh, [table, annotation_state, image_state, selected_state], [annotation_state, preview, crop, selected_state, active_text_state, status])
         rotate_left_button.click(
             rotate_page_left,
@@ -2787,16 +2905,28 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
             [table, annotation_state, image_state],
             [annotation_state, preview, crop, table, selected_state, active_text_state, status],
         )
+        # Korrekturfeld unter dem Zeilenausschnitt: Der Text wird ausdrücklich
+        # mit Enter oder ✓/✗ übernommen (nicht beim Verlassen des Felds - das
+        # könnte sich mit einem gleichzeitigen Klick auf eine andere Box oder
+        # Tabellenzeile überschneiden und die Korrektur überschreiben).
+        focus_line_text = "() => { setTimeout(() => { const t = document.querySelector('#line-text-box textarea, #line-text-box input'); if (t) { t.focus(); const n = t.value.length; t.setSelectionRange(n, n); } }, 150); }"
+        review_outputs = [annotation_state, preview, crop, table, selected_state, active_text_state, status, line_text]
+        review_inputs = [line_text, table, annotation_state, image_state, selected_state]
         for review_button, review_fn in (
             (accept_button, accept_selected),
             (reject_button, reject_selected),
             (accept_all_button, accept_all_open),
         ):
             review_button.click(
-                review_fn,
-                [table, annotation_state, image_state, selected_state],
-                [annotation_state, preview, crop, table, selected_state, active_text_state, status],
-            )
+                review_fn, review_inputs, review_outputs,
+                show_progress="hidden", concurrency_id="line_edit",
+            ).then(None, None, None, js=focus_line_text)
+        line_text.submit(
+            accept_selected, review_inputs, review_outputs, show_progress="hidden", concurrency_id="line_edit",
+        ).then(None, None, None, js=focus_line_text)
+        # Korrekturfeld bei jeder neuen Auswahl/Änderung mit dem aktuellen Text füllen.
+        selected_state.change(refresh_line_text, [annotation_state, selected_state, line_text], line_text, show_progress="hidden")
+        annotation_state.change(refresh_line_text, [annotation_state, selected_state, line_text], line_text, show_progress="hidden")
         rotate_box_left_button.click(
             rotate_box_left,
             [table, annotation_state, image_state, selected_state],
@@ -2868,7 +2998,9 @@ def main() -> None:
         help="Reiter, der beim Start geöffnet ist ('vergleich' = Modellvergleich)",
     )
     args = parser.parse_args()
+    _prune_preview_dir()
     build_interface(args.tab).launch(
+        allowed_paths=[str(PREVIEW_DIR)],
         server_name=args.host,
         server_port=args.port,
         share=args.share,

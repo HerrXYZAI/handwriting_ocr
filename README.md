@@ -228,11 +228,15 @@ Geprüft wird nicht mehr die ganze Datei, sondern jede Box einzeln. Jede Zeile h
 Prüfstatus: **✓ akzeptiert**, **✗ nicht akzeptiert** oder **offen** (Standard für neue
 Vorannotationen).
 
-- Vorschau: die kleinen Knöpfe ✓ / ✗ oben rechts an jeder Box (nochmal klicken = wieder
-  offen). Akzeptierte Boxen sind grün, nicht akzeptierte rot gestrichelt hinterlegt.
+- Schnellster Weg: Zeile anklicken, im Feld **"Text der ausgewählten Zeile"** unter dem
+  Zeilenausschnitt korrigieren und **Enter** drücken - der Text wird übernommen, die
+  Zeile akzeptiert und sofort die nächste Zeile geladen (Cursor steht wieder im Feld).
+- Vorschau: die kleinen Knöpfe ✓ / ✗ neben jeder Box (nochmal klicken = wieder offen).
+  Akzeptierte Boxen sind grün, nicht akzeptierte rot gestrichelt hinterlegt.
 - Tabelle: Spalte "Prüfung" (`✓ ok` / `✗ nein` / `offen`, von Hand auch `ok`, `x`,
   `ja`, `nein` tippbar) sowie die Knöpfe "✓ Zeile akzeptieren", "✗ Zeile nicht
-  akzeptieren" (springen zur nächsten offenen Zeile) und "Alle offenen akzeptieren".
+  akzeptieren" (übernehmen den Text aus dem Korrekturfeld und springen zur nächsten
+  Zeile) und "Alle offenen akzeptieren".
 - Dateiliste: grün = alle Boxen geprüft, gelb mit Zähler (z.B. `2/3`) = teilweise geprüft.
 
 Gespeichert wird der Status je Zeile als `review` in der `_annotation.json`. Ältere
