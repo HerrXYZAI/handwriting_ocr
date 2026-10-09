@@ -111,7 +111,11 @@ def list_ollama_models() -> list[str] | None:
             data = json.load(response)
     except Exception:
         return None
-    return sorted({m.get("name") for m in data.get("models", []) if m.get("name")})
+    # Interne "llamacpp:<Prüfsumme>"-Einträge ohne lesbaren Namen ausblenden.
+    return sorted({
+        m.get("name") for m in data.get("models", [])
+        if m.get("name") and not re.match(r"^[^:/]+:[0-9a-f]{40,}$", m.get("name"))
+    })
 
 
 def gpu_memory_gb() -> float | None:

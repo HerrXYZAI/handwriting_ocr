@@ -378,7 +378,11 @@ def list_ollama_models() -> list[str]:
         data = response.json()
     except Exception:
         return []
-    names = sorted({m.get("name") for m in data.get("models", []) if m.get("name")})
+    # Doppelte Namen und interne "llamacpp:<Prüfsumme>"-Einträge ausblenden.
+    names = sorted({
+        m.get("name") for m in data.get("models", [])
+        if m.get("name") and not re.match(r"^[^:/]+:[0-9a-f]{40,}$", m.get("name"))
+    })
     return names
 
 

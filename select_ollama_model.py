@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.request
 from pathlib import Path
@@ -34,6 +35,14 @@ def _request(path: str, payload: dict | None = None, timeout: float = 5) -> dict
         return json.load(response)
 
 
+_INTERNAL_NAME = re.compile(r"^[^:/]+:[0-9a-f]{40,}$")
+
+
+def is_internal_name(name: str) -> bool:
+    """z.B. "llamacpp:4695d1593d...": Prüfsummen-Alias ohne lesbaren Namen."""
+    return bool(_INTERNAL_NAME.match(name))
+
+
 def list_models() -> list[dict] | None:
     """Installierte Modelle mit Größe und (falls von Ollama gemeldet) Fähigkeiten."""
     try:
@@ -41,10 +50,15 @@ def list_models() -> list[dict] | None:
     except Exception:
         return None
     result = []
+    seen: set[str] = set()
     for model in models:
         name = model.get("name")
-        if not name:
+        # Ollama führt manche Modelle mehrfach (gleicher Name) und zusätzlich
+        # als interne "llamacpp:<Prüfsumme>"-Einträge ohne lesbaren Namen -
+        # jeden Namen nur einmal zeigen, Prüfsummen-Einträge ausblenden.
+        if not name or name in seen or is_internal_name(name):
             continue
+        seen.add(name)
         capabilities = None
         try:
             capabilities = _request("/api/show", {"model": name}).get("capabilities")
