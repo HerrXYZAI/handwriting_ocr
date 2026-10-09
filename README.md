@@ -137,7 +137,7 @@ Modellboxen (gestrichelt; rot "+" = Zeile ohne Referenz) sowie ein zeilenweiser
 Text-Diff (rot = fehlt/falsch, grün = stattdessen vom Modell geschrieben).
 
 **Kommandozeile** (empfohlen für lange Stapelläufe mit großen Modellen, auch über
-`run.bat`, Punkt 4). Seiten mit vorhandenem Lauf werden übersprungen, ein Abbruch mit
+`run.bat`, Punkt 5; die Oberfläche direkt im Vergleichsreiter startet Punkt 2 bzw. `python qwen_annotation_gui.py --tab vergleich`). Seiten mit vorhandenem Lauf werden übersprungen, ein Abbruch mit
 Strg+C verliert keine fertigen Seiten:
 
 ```powershell

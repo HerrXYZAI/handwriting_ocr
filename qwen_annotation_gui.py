@@ -2105,7 +2105,7 @@ def build_compare_tab(dataset_root: gr.Textbox):
     return page, run_a, run_b, compare_status
 
 
-def build_interface() -> gr.Blocks:
+def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
     with gr.Blocks(title="Qwen Handschrift-Annotation") as app:
         annotation_state = gr.State({})
         image_state = gr.State("")
@@ -2117,91 +2117,92 @@ def build_interface() -> gr.Blocks:
         # "Winkel übernehmen"-Knopf unter jeder Box mit einem Klick auf eine
         # andere Box anwenden.
         last_angle_state = gr.State(0.0)
-        with gr.Tab("Annotation"):
-            gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; der kleine Griff über einer Box dreht sie frei (z.B. für eine schräg geschriebene Zeile); ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
-            with gr.Accordion("Dateien im Dataset (Bilder & PDFs, inkl. Unterordner) - annotierte/freigegebene Dateien grün", open=True):
+        with gr.Tabs(selected=initial_tab):
+            with gr.Tab("Annotation", id="annotation"):
+                gr.Markdown("# Qwen-Vorannotation für Handschrift\nScan laden, vorannotieren, Texte korrigieren und als Annotation oder Trainings-JSONL speichern. Pixelkoordinaten sind führend und bleiben beim Import/Export unverändert.\nBoxen im Vorschaubild lassen sich per Maus verschieben (ziehen) und an den Eckpunkten skalieren; der kleine Griff über einer Box dreht sie frei (z.B. für eine schräg geschriebene Zeile); ein Klick auf eine Box blendet ihren Text darunter zum Bearbeiten ein.")
+                with gr.Accordion("Dateien im Dataset (Bilder & PDFs, inkl. Unterordner) - annotierte/freigegebene Dateien grün", open=True):
+                    with gr.Row():
+                        with gr.Column():
+                            gr.Markdown("**Alle Dateien**")
+                            file_list_all_html = gr.HTML(
+                                render_file_list(DEFAULT_DATASET_ROOT, sync_target=FILE_SYNC_ALL),
+                                elem_id="file-list-all-wrap",
+                            )
+                        with gr.Column():
+                            gr.Markdown("**Nur vorannotiert / annotiert**")
+                            file_list_flagged_html = gr.HTML(
+                                render_file_list(DEFAULT_DATASET_ROOT, only_flagged=True, sync_target=FILE_SYNC_FLAGGED),
+                                elem_id="file-list-flagged-wrap",
+                            )
+                    file_sync_all = gr.Textbox(elem_id=FILE_SYNC_ALL, visible=True, container=False)
+                    file_sync_flagged = gr.Textbox(elem_id=FILE_SYNC_FLAGGED, visible=True, container=False)
+                    refresh_files_button = gr.Button("Dateilisten aktualisieren")
                 with gr.Row():
-                    with gr.Column():
-                        gr.Markdown("**Alle Dateien**")
-                        file_list_all_html = gr.HTML(
-                            render_file_list(DEFAULT_DATASET_ROOT, sync_target=FILE_SYNC_ALL),
-                            elem_id="file-list-all-wrap",
-                        )
-                    with gr.Column():
-                        gr.Markdown("**Nur vorannotiert / annotiert**")
-                        file_list_flagged_html = gr.HTML(
-                            render_file_list(DEFAULT_DATASET_ROOT, only_flagged=True, sync_target=FILE_SYNC_FLAGGED),
-                            elem_id="file-list-flagged-wrap",
-                        )
-                file_sync_all = gr.Textbox(elem_id=FILE_SYNC_ALL, visible=True, container=False)
-                file_sync_flagged = gr.Textbox(elem_id=FILE_SYNC_FLAGGED, visible=True, container=False)
-                refresh_files_button = gr.Button("Dateilisten aktualisieren")
-            with gr.Row():
-                with gr.Column(scale=1):
-                    # image_mode=None ist noetig, damit Gradio beim Zurueck-Einlesen des
-                    # Pfads (preprocess) den Original-Pfad unveraendert durchreicht: mit dem
-                    # Default "RGB" schreibt Gradio jedes Bild, das nicht exakt im PIL-Modus
-                    # "RGB" vorliegt (z.B. Graustufen- oder Palette-PNGs aus Scans), still in
-                    # ein neues Cache-Temp-File um - dadurch landete die gespeicherte
-                    # Annotation nicht mehr neben der Originaldatei/preannotation.json.
-                    image = gr.Image(label="Originalscan", type="filepath", sources=["upload"], image_mode=None)
-                    with gr.Row():
-                        pdf_upload = gr.File(label="PDF-Scan (mehrseitig)", file_types=[".pdf"], type="filepath")
-                        pdf_page = gr.Number(label="Seite", value=1, precision=0, minimum=1)
-                    pdf_load = gr.Button("PDF-Seite laden")
-                    with gr.Row():
-                        split_button = gr.Button("Originalscan in Kacheln aufteilen")
-                        tile_number = gr.Number(label="Kachel", value=1, precision=0, minimum=1)
-                    load_tile_button = gr.Button("Kachel laden")
-                    with gr.Row():
-                        rotate_left_button = gr.Button("↺ 90° drehen")
-                        rotate_right_button = gr.Button("↻ 90° drehen")
-                    with gr.Row():
-                        model = gr.Dropdown(
-                            label="Ollama-Modell",
-                            choices=model_dropdown_choices(),
-                            value=DEFAULT_MODEL,
-                            allow_custom_value=True,
-                            scale=4,
-                        )
-                        refresh_models_button = gr.Button("🔄", scale=1, min_width=40)
-                    context = gr.Number(label="Kontextgröße", value=DEFAULT_CONTEXT_SIZE, precision=0)
-                    preannotate = gr.Button("Qwen-Vorannotation starten", variant="primary")
-                    with gr.Row():
-                        tesseract_lang = gr.Textbox(label="Tesseract-Sprache", value=tesseract_boxes.DEFAULT_LANG)
-                        tesseract_psm = gr.Number(label="Tesseract PSM", value=tesseract_boxes.DEFAULT_PSM, precision=0)
-                    tesseract_button = gr.Button("Tesseract-Boxen anwenden (Snap)")
-                    undo_tesseract_button = gr.Button("Tesseract-Boxen rückgängig (zurück zur geladenen Annotation)")
-                    existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
-                    load = gr.Button("Scan und JSON laden")
-                with gr.Column(scale=2):
-                    preview = gr.HTML(EMPTY_PREVIEW_HTML, label="Zeilenboxen", elem_id="bbox-preview-wrap")
-                    # visible=False would unmount this element in Gradio 6, breaking the
-                    # JS->Python bridge from render_interactive_preview; hide via CSS instead
-                    # so it stays queryable while a box is dragged/resized/edited.
-                    bbox_sync = gr.Textbox(elem_id="bbox-sync-box", visible=True, container=False)
-                    crop = gr.Image(label="Ausgewählte Zeile", type="pil", interactive=False, height=180)
-                    with gr.Row():
-                        add_box_button = gr.Button("Box hinzufügen")
-                        delete_box_button = gr.Button("Ausgewählte Box löschen")
-                        no_text_button = gr.Button("Seite ohne sichtbaren Text (leere Seite)")
-                    with gr.Row():
-                        rotate_box_left_button = gr.Button("↺ Box -5°")
-                        rotate_box_right_button = gr.Button("↻ Box +5°")
-                    table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number", "number"], column_count=(8, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
-            with gr.Row():
-                refresh_button = gr.Button("Änderungen übernehmen")
-                save_button = gr.Button("Annotations-JSON speichern")
-            with gr.Row():
-                dataset_root = gr.Textbox(label="Dataset-Wurzelverzeichnis", value=DEFAULT_DATASET_ROOT, placeholder=r"C:\Handschrift-Dataset")
-                export_mode = gr.Radio(["An Datei anhängen / Seite aktualisieren", "Datei ersetzen"], value="An Datei anhängen / Seite aktualisieren", label="Exportmodus")
-                export_button = gr.Button("Als Qwen-Trainings-JSONL exportieren", variant="primary")
-            with gr.Row():
-                annotation_file = gr.File(label="Annotations-JSON")
-                training_file = gr.File(label="Qwen-Trainings-JSONL")
-            status = gr.Textbox(label="Status", interactive=False)
-        with gr.Tab("Modellvergleich"):
-            compare_page_dd, compare_run_a, compare_run_b, compare_status = build_compare_tab(dataset_root)
+                    with gr.Column(scale=1):
+                        # image_mode=None ist noetig, damit Gradio beim Zurueck-Einlesen des
+                        # Pfads (preprocess) den Original-Pfad unveraendert durchreicht: mit dem
+                        # Default "RGB" schreibt Gradio jedes Bild, das nicht exakt im PIL-Modus
+                        # "RGB" vorliegt (z.B. Graustufen- oder Palette-PNGs aus Scans), still in
+                        # ein neues Cache-Temp-File um - dadurch landete die gespeicherte
+                        # Annotation nicht mehr neben der Originaldatei/preannotation.json.
+                        image = gr.Image(label="Originalscan", type="filepath", sources=["upload"], image_mode=None)
+                        with gr.Row():
+                            pdf_upload = gr.File(label="PDF-Scan (mehrseitig)", file_types=[".pdf"], type="filepath")
+                            pdf_page = gr.Number(label="Seite", value=1, precision=0, minimum=1)
+                        pdf_load = gr.Button("PDF-Seite laden")
+                        with gr.Row():
+                            split_button = gr.Button("Originalscan in Kacheln aufteilen")
+                            tile_number = gr.Number(label="Kachel", value=1, precision=0, minimum=1)
+                        load_tile_button = gr.Button("Kachel laden")
+                        with gr.Row():
+                            rotate_left_button = gr.Button("↺ 90° drehen")
+                            rotate_right_button = gr.Button("↻ 90° drehen")
+                        with gr.Row():
+                            model = gr.Dropdown(
+                                label="Ollama-Modell",
+                                choices=model_dropdown_choices(),
+                                value=DEFAULT_MODEL,
+                                allow_custom_value=True,
+                                scale=4,
+                            )
+                            refresh_models_button = gr.Button("🔄", scale=1, min_width=40)
+                        context = gr.Number(label="Kontextgröße", value=DEFAULT_CONTEXT_SIZE, precision=0)
+                        preannotate = gr.Button("Qwen-Vorannotation starten", variant="primary")
+                        with gr.Row():
+                            tesseract_lang = gr.Textbox(label="Tesseract-Sprache", value=tesseract_boxes.DEFAULT_LANG)
+                            tesseract_psm = gr.Number(label="Tesseract PSM", value=tesseract_boxes.DEFAULT_PSM, precision=0)
+                        tesseract_button = gr.Button("Tesseract-Boxen anwenden (Snap)")
+                        undo_tesseract_button = gr.Button("Tesseract-Boxen rückgängig (zurück zur geladenen Annotation)")
+                        existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
+                        load = gr.Button("Scan und JSON laden")
+                    with gr.Column(scale=2):
+                        preview = gr.HTML(EMPTY_PREVIEW_HTML, label="Zeilenboxen", elem_id="bbox-preview-wrap")
+                        # visible=False would unmount this element in Gradio 6, breaking the
+                        # JS->Python bridge from render_interactive_preview; hide via CSS instead
+                        # so it stays queryable while a box is dragged/resized/edited.
+                        bbox_sync = gr.Textbox(elem_id="bbox-sync-box", visible=True, container=False)
+                        crop = gr.Image(label="Ausgewählte Zeile", type="pil", interactive=False, height=180)
+                        with gr.Row():
+                            add_box_button = gr.Button("Box hinzufügen")
+                            delete_box_button = gr.Button("Ausgewählte Box löschen")
+                            no_text_button = gr.Button("Seite ohne sichtbaren Text (leere Seite)")
+                        with gr.Row():
+                            rotate_box_left_button = gr.Button("↺ Box -5°")
+                            rotate_box_right_button = gr.Button("↻ Box +5°")
+                        table = gr.Dataframe(headers=TABLE_HEADERS, datatype=["str", "str", "str", "number", "number", "number", "number", "number"], column_count=(8, "fixed"), label="Text und Pixelboxen korrigieren", interactive=True, wrap=True)
+                with gr.Row():
+                    refresh_button = gr.Button("Änderungen übernehmen")
+                    save_button = gr.Button("Annotations-JSON speichern")
+                with gr.Row():
+                    dataset_root = gr.Textbox(label="Dataset-Wurzelverzeichnis", value=DEFAULT_DATASET_ROOT, placeholder=r"C:\Handschrift-Dataset")
+                    export_mode = gr.Radio(["An Datei anhängen / Seite aktualisieren", "Datei ersetzen"], value="An Datei anhängen / Seite aktualisieren", label="Exportmodus")
+                    export_button = gr.Button("Als Qwen-Trainings-JSONL exportieren", variant="primary")
+                with gr.Row():
+                    annotation_file = gr.File(label="Annotations-JSON")
+                    training_file = gr.File(label="Qwen-Trainings-JSONL")
+                status = gr.Textbox(label="Status", interactive=False)
+            with gr.Tab("Modellvergleich", id="vergleich"):
+                compare_page_dd, compare_run_a, compare_run_b, compare_status = build_compare_tab(dataset_root)
 
         # .upload() (not .change()) is required here: only a genuine manual
         # upload should discard the previous annotation. select_dataset_file /
@@ -2322,8 +2323,14 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default=7860, type=int)
     parser.add_argument("--share", action="store_true")
+    parser.add_argument(
+        "--tab",
+        choices=("annotation", "vergleich"),
+        default="annotation",
+        help="Reiter, der beim Start geöffnet ist ('vergleich' = Modellvergleich)",
+    )
     args = parser.parse_args()
-    build_interface().launch(
+    build_interface(args.tab).launch(
         server_name=args.host,
         server_port=args.port,
         share=args.share,

@@ -50,34 +50,43 @@ echo ===================================================
 echo  Qwen Handschrift-OCR
 echo ===================================================
 echo  1. Annotations-GUI starten
-echo  2. Vorannotation (qwen_preannotate.py)
-echo  3. Annotation validieren (validate_annotations.py)
-echo  4. Modellvergleich auf geprueften Seiten (model_compare.py)
-echo  5. Tesseract-Dienst starten (Docker, fuer Box-Anpassung)
-echo  6. Trainings-Datensatz exportieren (qwen_export_dataset.py)
-echo  7. Finetuning starten (Docker, in finetune\)
-echo  8. Adapter mit Basismodell zusammenfuehren (Docker, finetune\merge.sh)
-echo  9. Zurueck nach Ollama (GGUF konvertieren, quantisieren, importieren)
-echo 10. Beenden
+echo  2. Modellvergleich-GUI starten (GUI, Reiter Modellvergleich)
+echo  3. Vorannotation (qwen_preannotate.py)
+echo  4. Annotation validieren (validate_annotations.py)
+echo  5. Modellvergleich per Kommandozeile (model_compare.py)
+echo  6. Tesseract-Dienst starten (Docker, fuer Box-Anpassung)
+echo  7. Trainings-Datensatz exportieren (qwen_export_dataset.py)
+echo  8. Finetuning starten (Docker, in finetune\)
+echo  9. Adapter mit Basismodell zusammenfuehren (Docker, finetune\merge.sh)
+echo 10. Zurueck nach Ollama (GGUF konvertieren, quantisieren, importieren)
+echo 11. Beenden
 echo ===================================================
 set "CHOICE="
-set /p CHOICE="Auswahl (1-10, Enter = 1): "
+set /p CHOICE="Auswahl (1-11, Enter = 1): "
 if "%CHOICE%"=="" set "CHOICE=1"
 
 if "%CHOICE%"=="1" goto :gui
-if "%CHOICE%"=="2" goto :preannotate
-if "%CHOICE%"=="3" goto :validate
-if "%CHOICE%"=="4" goto :compare
-if "%CHOICE%"=="5" goto :tesseract
-if "%CHOICE%"=="6" goto :export
-if "%CHOICE%"=="7" goto :finetune
-if "%CHOICE%"=="8" goto :merge_adapter
-if "%CHOICE%"=="9" goto :to_ollama
-if "%CHOICE%"=="10" goto :eof
+if "%CHOICE%"=="2" goto :compare_gui
+if "%CHOICE%"=="3" goto :preannotate
+if "%CHOICE%"=="4" goto :validate
+if "%CHOICE%"=="5" goto :compare
+if "%CHOICE%"=="6" goto :tesseract
+if "%CHOICE%"=="7" goto :export
+if "%CHOICE%"=="8" goto :finetune
+if "%CHOICE%"=="9" goto :merge_adapter
+if "%CHOICE%"=="10" goto :to_ollama
+if "%CHOICE%"=="11" goto :eof
 goto :menu
 
 :gui
 "%PYEXE%" qwen_annotation_gui.py
+goto :done
+
+:compare_gui
+echo.
+echo Startet die Oberflaeche direkt im Reiter "Modellvergleich". Laeuft die
+echo Annotations-GUI (Punkt 1) bereits, dort einfach den Reiter wechseln.
+"%PYEXE%" qwen_annotation_gui.py --tab vergleich
 goto :done
 
 :preannotate
