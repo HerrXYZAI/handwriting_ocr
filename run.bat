@@ -96,10 +96,13 @@ goto :done
 :preannotate
 echo.
 echo Pfad ohne Anfuehrungszeichen eingeben, auch bei Leerzeichen im Pfad.
+rem Standard: Ordner pictures_for_OCR neben run.bat (Enter uebernimmt ihn).
+set "DEFAULT_INPUT_PATH=%~dp0pictures_for_OCR"
 set "INPUT_PATH="
-set /p INPUT_PATH="Bild-/PDF-Datei oder Ordner: "
-if "%INPUT_PATH%"=="" (
-  echo Kein Pfad angegeben.
+set /p INPUT_PATH="Bild-/PDF-Datei oder Ordner (Enter = %DEFAULT_INPUT_PATH%): "
+if "%INPUT_PATH%"=="" set "INPUT_PATH=%DEFAULT_INPUT_PATH%"
+if not exist "%INPUT_PATH%" (
+  echo Pfad nicht gefunden: %INPUT_PATH%
   goto :done
 )
 rem Modell aus der Liste der installierten Ollama-Modelle waehlen; das zuletzt
