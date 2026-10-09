@@ -227,8 +227,17 @@ rem Fuer Qwen3.5/3.6 braucht das Image ein aktuelles ms-swift/transformers;
 rem PACKAGES_REFRESH mit neuem Wert baut nur die Paket-Schicht neu.
 set "FT_BUILD_ARGS="
 set "FT_REFRESH=n"
+rem Erst im vorhandenen Image pruefen, ob ms-swift das Modell schon kennt
+rem (z.B. weil die Pakete in einem frueheren Lauf aktualisiert wurden) -
+rem nur sonst nach einer Aktualisierung fragen.
+set "FT_SUPPORTED=0"
 if "!FT_NEW_ARCH!"=="1" (
   echo.
+  echo Pruefe, ob das Trainings-Image !FT_MODEL! bereits unterstuetzt ...
+  docker run --rm -v "%CD%:/chk:ro" --entrypoint python3 handschrift-ocr-finetune:latest /chk/check_model_support.py "!FT_MODEL!"
+  if !errorlevel!==0 set "FT_SUPPORTED=1"
+)
+if "!FT_NEW_ARCH!"=="1" if "!FT_SUPPORTED!"=="0" (
   echo !FT_MODEL! braucht ein aktuelles ms-swift im Trainings-Image.
   set /p FT_REFRESH="Python-Pakete im Image jetzt aktualisieren? Dauert einige Minuten. (J/n): "
   if "!FT_REFRESH!"=="" set "FT_REFRESH=j"
