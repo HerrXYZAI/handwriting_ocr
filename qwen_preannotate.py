@@ -189,7 +189,27 @@ def clamp(value: int, low: int, high: int) -> int:
     return max(low, min(high, value))
 
 
+_BBOX_NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
+
+
+def coerce_bbox(value: Any) -> Any:
+    """Repariert Boxen, die das Modell als Text statt als Zahlenliste
+    liefert, z.B. ":[94,112,617,151]," (kommt bei großen Modellen mit
+    format=json vor). Genau vier Zahlen im Text -> Liste; sonst unverändert."""
+    if isinstance(value, str):
+        numbers = _BBOX_NUMBER_RE.findall(value)
+        if len(numbers) == 4:
+            return [float(n) for n in numbers]
+    if isinstance(value, (list, tuple)) and len(value) == 4 and all(isinstance(v, str) for v in value):
+        try:
+            return [float(v) for v in value]
+        except ValueError:
+            return value
+    return value
+
+
 def validate_local_bbox(value: Any) -> list[int]:
+    value = coerce_bbox(value)
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         raise ValueError(f"Ungültige Bounding-Box: {value!r}")
     values = [clamp(round(float(v)), 0, 1000) for v in value]

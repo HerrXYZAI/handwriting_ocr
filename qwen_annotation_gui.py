@@ -19,6 +19,7 @@ import requests
 from PIL import Image, ImageOps
 
 import model_compare
+import qwen_preannotate
 import pdf_utils
 import tesseract_boxes
 import tiling
@@ -135,6 +136,8 @@ def clamp(value: int, low: int, high: int) -> int:
 
 
 def validate_bbox(value: Any) -> list[int]:
+    # Boxen als Text (z.B. ":[94,112,617,151],") wie in qwen_preannotate reparieren.
+    value = qwen_preannotate.coerce_bbox(value)
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         raise ValueError(f"Ungültige Box: {value!r}")
     coords = [clamp(round(float(v)), 0, 1000) for v in value]
