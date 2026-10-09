@@ -25,6 +25,9 @@ services:
       # 1 = Modelle von Hugging Face laden (Standard), 0 = von ModelScope (modelscope.cn,
       # ms-swift-Voreinstellung; von Europa aus oft langsam oder nicht erreichbar).
       USE_HF: ${USE_HF:-1}
+      # Optional: Hugging-Face-Token (huggingface.co/settings/tokens, Leserecht genügt)
+      # für höhere Download-Limits; in finetune\.env als HF_TOKEN=hf_... eintragen.
+      HF_TOKEN: ${HF_TOKEN:-}
     stdin_open: true
     tty: true
     command: ["./train.sh"]
