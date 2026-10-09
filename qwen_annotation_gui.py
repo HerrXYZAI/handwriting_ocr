@@ -6,6 +6,7 @@ import copy
 import datetime
 import functools
 import hashlib
+import inspect
 import io
 import json
 import math
@@ -3051,7 +3052,26 @@ def main() -> None:
         share=args.share,
         inbrowser=True,
         head=BBOX_STYLE + model_compare.COMPARE_STYLE,
+        **launch_speed_options(),
     )
+
+
+def launch_speed_options() -> dict[str, Any]:
+    """Gradio 6 schreibt sonst bei JEDEM Ereignis (Seitenwahl, Boxklick,
+    Akzeptieren ...) den kompletten Verlauf aller Ein-/Ausgaben - hier samt
+    Vorschau-HTML und Tabelle, bis zu 100 Läufe, schnell mehrere MB - neu in
+    den localStorage des Browsers. Das läuft synchron im Browser-Hauptthread;
+    ist der Speicher voll, kürzt Gradio den Verlauf Eintrag für Eintrag und
+    serialisiert jedes Mal neu. Das Fenster friert dann sekundenlang ein, auch
+    Tippen und Markieren im Textfeld hängen. run_history=False schaltet das ab
+    und löscht den bisher gespeicherten Verlauf im Browser."""
+    os.environ.setdefault("GRADIO_RUN_HISTORY", "False")
+    try:
+        if "run_history" in inspect.signature(gr.Blocks.launch).parameters:
+            return {"run_history": False}
+    except (TypeError, ValueError):
+        pass
+    return {}
 
 
 if __name__ == "__main__":
