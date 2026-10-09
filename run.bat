@@ -177,7 +177,13 @@ if not %errorlevel%==0 (
 echo.
 echo Baut bei Bedarf das Image und startet den Tesseract-Dienst im Hintergrund
 echo unter http://127.0.0.1:8884 ^(siehe docker\tesseract-ocr\^).
-docker compose -f docker\tesseract-ocr\docker-compose.yml up -d --build
+rem Wie beim Finetuning direkt bauen statt "compose up --build" (buildx bake).
+docker build -t handschrift-ocr-tesseract:latest docker\tesseract-ocr
+if errorlevel 1 (
+  echo Bau des Tesseract-Images fehlgeschlagen ^(siehe Meldungen oben^).
+  goto :done
+)
+docker compose -f docker\tesseract-ocr\docker-compose.yml up -d --no-build
 goto :done
 
 :finetune
@@ -214,7 +220,16 @@ echo Baut bei Bedarf das Image und startet das Finetuning von !FT_MODEL! im
 echo Vordergrund ^(siehe finetune\^). Mit Strg+C abbrechen.
 echo Checkpoints: OUTPUT_DIR aus finetune\.env, Unterordner !FT_MODEL_SLUG!-handschrift
 pushd finetune
-docker compose up --build
+rem Image direkt mit "docker build" bauen statt per "docker compose up --build":
+rem Compose nutzt dafuer "buildx bake", das bei manchen Docker-Desktop-Versionen
+rem ohne Angabe von Gruenden mit "failed to execute bake" abbricht.
+docker build -t handschrift-ocr-finetune:latest .
+if errorlevel 1 (
+  echo Bau des Trainings-Images fehlgeschlagen ^(siehe Meldungen oben^).
+  popd
+  goto :done
+)
+docker compose up --no-build
 popd
 rem Auswahl nicht an spaetere Menuepunkte weiterreichen.
 set "FT_MODEL="

@@ -268,7 +268,8 @@ den die Oberfläche und die Kommandozeile über HTTP ansprechen, ähnlich wie
 Ollama:
 
 ```powershell
-docker compose -f docker\tesseract-ocr\docker-compose.yml up -d --build
+docker build -t handschrift-ocr-tesseract:latest docker\tesseract-ocr
+docker compose -f docker\tesseract-ocr\docker-compose.yml up -d --no-build
 ```
 
 Danach ist der Dienst unter `http://127.0.0.1:8884` erreichbar. Verwendung:
