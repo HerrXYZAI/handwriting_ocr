@@ -22,6 +22,9 @@ services:
       FT_DATASET: ${FT_DATASET:-/data/train_swift.jsonl}
       FT_OUTPUT_DIR: ${FT_OUTPUT_DIR_CONTAINER:-/output/qwen3-vl-4b-handschrift}
       FT_EPOCHS: ${FT_EPOCHS:-3}
+      # 1 = Modelle von Hugging Face laden (Standard), 0 = von ModelScope (modelscope.cn,
+      # ms-swift-Voreinstellung; von Europa aus oft langsam oder nicht erreichbar).
+      USE_HF: ${USE_HF:-1}
     stdin_open: true
     tty: true
     command: ["./train.sh"]

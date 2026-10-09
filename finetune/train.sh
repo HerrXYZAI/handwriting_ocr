@@ -21,7 +21,11 @@ MAX_LENGTH="${FT_MAX_LENGTH:-8192}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-log "Starte Training: $MODEL, Datensatz $DATASET, Ausgabe $OUTPUT_DIR, $EPOCHS Epochen"
+# ms-swift laedt standardmaessig von ModelScope (modelscope.cn); USE_HF=1 (Standard
+# in docker-compose.yml) nimmt stattdessen Hugging Face.
+export USE_HF="${USE_HF:-1}"
+if [ "$USE_HF" = "1" ]; then MODEL_SOURCE="Hugging Face"; else MODEL_SOURCE="ModelScope"; fi
+log "Starte Training: $MODEL (Quelle: $MODEL_SOURCE), Datensatz $DATASET, Ausgabe $OUTPUT_DIR, $EPOCHS Epochen"
 swift sft \
     --model "$MODEL" \
     --tuner_type lora \

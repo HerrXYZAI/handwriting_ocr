@@ -95,6 +95,7 @@ als zusätzliche CLI-Argumente anhängen – alles nach `./train.sh` wird 1:1 an
 | `FT_DATASET`     | `/data/train_swift.jsonl`              | konvertierte Trainingsdatei         |
 | `FT_OUTPUT_DIR`  | `/output/qwen3-vl-4b-handschrift`      | Checkpoint-Ausgabeordner            |
 | `FT_EPOCHS`      | `3`                                     | Anzahl Trainings-Epochen            |
+| `USE_HF`         | `1`                                     | `1` = Modell von Hugging Face laden, `0` = von ModelScope |
 
 Beispiel mit mehr Epochen und aufgetautem Vision-Tower:
 
