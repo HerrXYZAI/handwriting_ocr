@@ -208,3 +208,15 @@ umgestellt werden (beide sprechen aktuell nur Ollamas `/api/chat`-Format).
   vor diesem Fix erzeugter `checkpoint-XXX-merged`-Ordner noch existiert,
   diesen löschen und `merge.sh` erneut laufen lassen (das Skript räumt den
   Zielordner inzwischen auch selbst auf, falls er schon existiert).
+- **Ollama lädt ein feinabgestimmtes Qwen3.5/3.6-Modell nicht:
+  `error loading model: check_tensor_dims: tensor 'blk.32.attn_norm.weight'
+  not found`** (die Zahl hängt von der Modellgröße ab): Qwen3.5/3.6 haben eine
+  zusätzliche MTP-Schicht (Multi-Token-Prediction). Beim Zusammenführen gehen
+  deren Gewichte verloren, der GGUF-Konverter zählt die Schicht aber mit.
+  `to_ollama.ps1` konvertiert solche Modelle inzwischen mit `--no-mtp` (und
+  holt bei Bedarf ein aktuelles `llama.cpp:full`-Image, das die Option
+  kennt). Abhilfe: `run.bat` → 10 „Zurück nach Ollama“ mit demselben
+  `checkpoint-XXX-merged`-Ordner erneut ausführen; Training und Merge müssen
+  nicht wiederholt werden. Die Vorannotation bricht bei solchen Ladefehlern
+  jetzt sofort mit diesem Hinweis ab, statt jede Datei einzeln scheitern zu
+  lassen.

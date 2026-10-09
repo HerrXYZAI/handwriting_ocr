@@ -108,9 +108,41 @@ $TextGguf = "model-f16.gguf"
 $MmprojGguf = "mmproj-f16.gguf"
 $QuantGguf = "model-$Quant.gguf"
 
+# Qwen3.5/3.6 haben zusaetzlich eine MTP-Schicht (Multi-Token-Prediction,
+# "mtp_num_hidden_layers" in config.json, Gewichte unter "mtp.*"). Beim
+# Zusammenfuehren nach dem Training gehen diese Gewichte verloren, der
+# Konverter zaehlt die Schicht aber trotzdem mit. Ergebnis: Ollama bricht beim
+# Laden mit "tensor 'blk.32.attn_norm.weight' not found" ab. Ollama nutzt MTP
+# ohnehin nicht - daher ohne diese Schicht konvertieren (--no-mtp).
+$ConvertExtraArgs = @()
+$ConfigPath = Join-Path $MergedDir "config.json"
+if ((Test-Path $ConfigPath) -and ((Get-Content $ConfigPath -Raw) -match '"mtp_num_hidden_layers"\s*:\s*[1-9]')) {
+    # Stderr-Ausgaben von docker (z.B. Pull-Fortschritt) duerfen hier nicht
+    # zum Abbruch fuehren ($ErrorActionPreference = "Stop" gilt sonst auch
+    # fuer per 2>&1 umgeleitete Meldungen nativer Programme).
+    $PreviousPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $ConvertHelp = (docker run --rm $LlamaCppImage --convert --help 2>&1 | Out-String)
+        if ($ConvertHelp -notmatch '--no-mtp') {
+            Write-Log "Konverter im Image kennt --no-mtp noch nicht - hole aktuelles $LlamaCppImage ..."
+            docker pull $LlamaCppImage
+            $ConvertHelp = (docker run --rm $LlamaCppImage --convert --help 2>&1 | Out-String)
+        }
+    } finally {
+        $ErrorActionPreference = $PreviousPreference
+    }
+    if ($ConvertHelp -match '--no-mtp') {
+        Write-Log "Modell mit MTP-Schicht (Qwen3.5/3.6): konvertiere ohne MTP-Schicht (--no-mtp)."
+        $ConvertExtraArgs += "--no-mtp"
+    } else {
+        Write-Log "WARNUNG: Konverter unterstuetzt --no-mtp nicht; das Modell laedt in Ollama evtl. nicht (fehlende blk.N-Tensoren)."
+    }
+}
+
 Write-Log "1/4 Konvertiere Textmodell nach GGUF (f16)..."
 docker run --rm -v "${MergedDir}:/model:ro" -v "${GgufDir}:/gguf" $LlamaCppImage `
-    --convert /model --outfile "/gguf/$TextGguf" --outtype f16
+    --convert /model --outfile "/gguf/$TextGguf" --outtype f16 @ConvertExtraArgs
 if ($LASTEXITCODE -ne 0) { Write-LogError "Konvertierung des Textmodells fehlgeschlagen."; exit 1 }
 
 Write-Log "2/4 Exportiere Vision-Projektor (mmproj, f16)..."

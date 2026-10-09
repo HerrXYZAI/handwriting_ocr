@@ -145,6 +145,41 @@ class RepetitionLoopError(RuntimeError):
     pass
 
 
+class ModelLoadError(RuntimeError):
+    """Ollama kann das Modell gar nicht laden (defekte/inkompatible GGUF-Datei,
+    Modell nicht vorhanden, zu wenig Speicher). Das betrifft jede weitere Seite
+    genauso - der Lauf wird daher sofort abgebrochen statt Datei für Datei
+    denselben Fehler zu produzieren."""
+
+
+_MODEL_LOAD_ERROR_MARKERS = (
+    "error loading model",
+    "llama-server process has terminated",
+    "failed to load model",
+    "unable to load model",
+    "model requires more system memory",
+    "try pulling it first",
+)
+
+
+def is_model_load_error(text: str) -> bool:
+    lowered = (text or "").lower()
+    return any(marker in lowered for marker in _MODEL_LOAD_ERROR_MARKERS)
+
+
+def model_load_error(model: str, status: int, text: str) -> ModelLoadError:
+    message = f"Ollama kann das Modell '{model}' nicht laden (HTTP {status}): {text.strip()[:400]}"
+    if re.search(r"tensor 'blk\.\d+\.[^']*' not found", text):
+        message += (
+            "\nHinweis: Die GGUF-Datei erwartet mehr Schichten, als sie enthält. Typisch für "
+            "selbst feinabgestimmte Qwen3.5/3.6-Modelle: der Konverter zählt die MTP-Schicht "
+            "(Multi-Token-Prediction) mit, das zusammengeführte Modell enthält sie aber nicht. "
+            "Modell bitte mit dem aktuellen to_ollama.ps1 neu importieren (run.bat, Punkt "
+            "10 'Zurueck nach Ollama') - es konvertiert jetzt ohne MTP-Schicht."
+        )
+    return ModelLoadError(message)
+
+
 class OllamaLineLogger:
     """Sammelt Streaming-Fragmente, protokolliert fertige Textzeilen und bricht bei Wiederholungsschleifen ab."""
 
@@ -364,6 +399,10 @@ def _post_ollama_stream(api_url: str, payload: dict[str, Any], timeout: int) -> 
     """Sendet die Anfrage; lehnt eine ältere Ollama-Version oder ein Modell den
     Parameter "think" ab, wird einmal ohne ihn wiederholt."""
     response = requests.post(api_url, json=payload, stream=True, timeout=(30, timeout))
+    if not response.ok and is_model_load_error(response.text):
+        # Kein Schema-Problem: das Modell lädt gar nicht - eine Wiederholung
+        # mit format=json würde nur denselben Ladefehler erneut erzeugen.
+        return response
     if not response.ok and isinstance(payload.get("format"), dict):
         LOG.warning(
             "Ollama lehnt das JSON-Schema ab (%s); Anfrage wird mit format=json wiederholt.",
@@ -444,6 +483,8 @@ def _call_ollama(
     try:
         with _post_ollama_stream(api_url, payload, timeout) as response:
             if not response.ok:
+                if is_model_load_error(response.text):
+                    raise model_load_error(model, response.status_code, response.text)
                 raise RuntimeError(f"Ollama-Fehler {response.status_code}: {response.text}")
             for raw_line in response.iter_lines(decode_unicode=True):
                 if not raw_line:
@@ -453,6 +494,8 @@ def _call_ollama(
                 except json.JSONDecodeError as error:
                     raise RuntimeError("Ollama lieferte ungültiges Streaming-JSON.") from error
                 if "error" in event:
+                    if is_model_load_error(str(event["error"])):
+                        raise model_load_error(model, 200, str(event["error"]))
                     raise RuntimeError(f"Ollama-Fehler: {event['error']}")
                 message = event.get("message", {})
                 fragment = str(message.get("content", ""))
@@ -770,6 +813,9 @@ def process_folder(args: argparse.Namespace, folder: Path) -> list[Path]:
         item_args.image = str(item)
         try:
             outputs.extend(process_scan(item_args))
+        except ModelLoadError:
+            # Betrifft alle weiteren Dateien genauso -> sofort abbrechen.
+            raise
         except Exception as error:
             tprint(f"FEHLER bei {item.name}: {error}", file=sys.stderr)
 
@@ -848,6 +894,9 @@ def process_untiled_page(
         lines = finalize_lines(run_tile(tile, args))
     except Exception as error:
         errors.append({"tile": tile.index, "box": list(tile.box), "error": str(error)})
+        if isinstance(error, ModelLoadError):
+            LOG.error("%s", error)
+            raise
         LOG.exception("Fehler in Abschnitt %d: %s", tile.index, error)
         if not args.continue_on_error:
             raise
@@ -903,6 +952,9 @@ def process_tiled_page(
             lines = finalize_lines(run_tile(tile, args))
         except Exception as error:
             errors.append({"tile": tile.index, "box": list(tile.box), "error": str(error)})
+            if isinstance(error, ModelLoadError):
+                LOG.error("%s", error)
+                raise
             LOG.exception("Fehler in Abschnitt %d: %s", tile.index, error)
             if not args.continue_on_error:
                 raise
