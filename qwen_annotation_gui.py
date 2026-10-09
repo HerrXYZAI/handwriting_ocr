@@ -110,20 +110,27 @@ def open_scan(image_path: str | Path) -> Image.Image:
         return ImageOps.exif_transpose(source).convert("RGB")
 
 
-_EXIF_ORIENTATION = 0x0112
-
-
 def scan_size(image_path: str | Path) -> tuple[int, int]:
-    """Bildgröße wie open_scan(...).size (inkl. EXIF-Drehung), aber nur aus dem
-    Dateikopf gelesen - ohne den kompletten Scan zu dekodieren. Vorher kostete
-    allein das beim Speichern/Laden spürbar Zeit."""
-    with Image.open(image_path) as source:
-        width, height = source.size
-        try:
-            orientation = source.getexif().get(_EXIF_ORIENTATION, 1)
-        except Exception:
-            orientation = 1
-    return (height, width) if orientation in (5, 6, 7, 8) else (width, height)
+    """Bildgröße wie open_scan(...).size (inkl. EXIF-Drehung). Kommt aus dem
+    Zwischenspeicher des Vorschaubilds (_cached_display), sodass jeder Scan
+    nur einmal eingelesen wird - die Vorschau braucht ihn ohnehin. (Eine
+    reine Kopf-Abfrage reicht bei PNG nicht: Pillow liest für die EXIF-Daten
+    dort die ganze Datei.)"""
+    return _cached_display(*_display_cache_key(image_path, 0))[0].size
+
+
+def display_image_file(image_path: str | None) -> str | None:
+    """Verkleinertes Vorschaubild als Datei für das Feld "Originalscan" -
+    statt des kompletten Scans (oft > 10 MB), den der Browser sonst bei jeder
+    Seitenauswahl laden und dekodieren müsste. Verarbeitet wird immer der
+    Original-Pfad aus image_state, nie dieses Anzeigebild."""
+    if not image_path:
+        return image_path
+    try:
+        file_path = _cached_display(*_display_cache_key(image_path, 0))[3]
+    except Exception:
+        return image_path
+    return file_path or image_path
 
 
 def open_scan_for_display(image_path: str | Path, annotation: dict[str, Any]) -> Image.Image:
@@ -165,7 +172,7 @@ def display_data_uri(image_path: str | Path, annotation: dict[str, Any]) -> str:
     """Quelle (src) des verkleinerten Vorschaubilds: URL der zwischengespeicherten
     Datei, ersatzweise data-URI (siehe _cached_display)."""
     rotation = int(annotation.get("image", {}).get("pending_rotation", 0)) % 360
-    _, data_uri, url = _cached_display(*_display_cache_key(image_path, rotation))
+    _, data_uri, url, _ = _cached_display(*_display_cache_key(image_path, rotation))
     return url or data_uri
 
 
@@ -176,7 +183,7 @@ def _display_cache_key(image_path: str | Path, rotation: int) -> tuple[str, int,
 
 
 @functools.lru_cache(maxsize=6)
-def _cached_display(path: str, mtime_ns: int, size: int, rotation: int) -> tuple[Image.Image, str, str | None]:
+def _cached_display(path: str, mtime_ns: int, size: int, rotation: int) -> tuple[Image.Image, str, str | None, str | None]:
     """Liest einen Scan nur einmal ein und hält ihn samt fertig kodiertem
     Vorschaubild vor. Vorher wurde bei jedem Klick auf eine Box die komplette
     Scan-Datei zweimal neu dekodiert, verkleinert und als JPEG kodiert, was die
@@ -189,6 +196,7 @@ def _cached_display(path: str, mtime_ns: int, size: int, rotation: int) -> tuple
         image = image.rotate(-rotation, expand=True)
     data_uri = encode_display_image(image)
     url = None
+    file_path = None
     if _PREVIEW_FILES_OK:
         key = hashlib.sha1(f"{path}|{mtime_ns}|{size}|{rotation}".encode("utf-8")).hexdigest()[:20]
         target = PREVIEW_DIR / f"{key}.jpg"
@@ -196,9 +204,10 @@ def _cached_display(path: str, mtime_ns: int, size: int, rotation: int) -> tuple
             if not target.is_file():
                 target.write_bytes(base64.b64decode(data_uri.split(",", 1)[1]))
             url = PREVIEW_URL_PREFIX + urllib.parse.quote(target.resolve().as_posix(), safe="/:")
+            file_path = str(target)
         except OSError:
             url = None
-    return image, data_uri, url
+    return image, data_uri, url, file_path
 
 
 def encode_image(path: Path) -> str:
@@ -1389,8 +1398,8 @@ def load_pdf_page_and_autoload(pdf_path: str | None, page_number: float | int | 
         auto_load_existing_annotation(image_path)
     )
     return (
-        image_path, image_state_path, annotation, selected, preview, crop_img, table_rows, active_text, existing_path,
-        f"{page_status} {load_status}",
+        display_image_file(image_path), image_state_path, annotation, selected, preview, crop_img, table_rows,
+        active_text, existing_path, f"{page_status} {load_status}",
     )
 
 
@@ -1400,8 +1409,8 @@ def load_tile_and_autoload(tile_paths: list[str], tile_number: float | int | Non
         auto_load_existing_annotation(image_path)
     )
     return (
-        image_path, image_state_path, annotation, selected, preview, crop_img, table_rows, active_text, existing_path,
-        f"{tile_status} {load_status}",
+        display_image_file(image_path), image_state_path, annotation, selected, preview, crop_img, table_rows,
+        active_text, existing_path, f"{tile_status} {load_status}",
     )
 
 
@@ -1433,7 +1442,7 @@ def select_dataset_file(payload_json: str, dataset_root: str):
     )
     all_html, flagged_html = render_file_lists(dataset_root, path)
     return (
-        image_path,
+        display_image_file(image_path),
         image_state_path,
         annotation,
         selected,
@@ -2773,7 +2782,7 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                         # "RGB" vorliegt (z.B. Graustufen- oder Palette-PNGs aus Scans), still in
                         # ein neues Cache-Temp-File um - dadurch landete die gespeicherte
                         # Annotation nicht mehr neben der Originaldatei/preannotation.json.
-                        image = gr.Image(label="Originalscan", type="filepath", sources=["upload"], image_mode=None)
+                        image = gr.Image(label="Originalscan (Vorschau - Bild hierher ziehen zum Hochladen)", type="filepath", sources=["upload"], image_mode=None)
                         with gr.Row():
                             pdf_upload = gr.File(label="PDF-Scan (mehrseitig)", file_types=[".pdf"], type="filepath")
                             pdf_page = gr.Number(label="Seite", value=1, precision=0, minimum=1)
@@ -2872,13 +2881,13 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
             [pdf_upload, pdf_page],
             [image, image_state, annotation_state, selected_state, preview, crop, table, active_text_state, existing, status],
         )
-        split_button.click(split_into_tiles, [image], [tile_paths_state, status])
+        split_button.click(split_into_tiles, [image_state], [tile_paths_state, status])
         load_tile_button.click(
             load_tile_and_autoload,
             [tile_paths_state, tile_number],
             [image, image_state, annotation_state, selected_state, preview, crop, table, active_text_state, existing, status],
         )
-        preannotate.click(start_preannotation, [image, model, context], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status]).then(
+        preannotate.click(start_preannotation, [image_state, model, context], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status]).then(
             lambda path, name: refresh_annotation_sources(path, f"pre:{(name or '').strip()}"),
             [image_state, model],
             source_select,
@@ -2902,7 +2911,7 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
             [image_state, existing],
             [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status],
         )
-        load.click(load_annotation, [image, existing], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
+        load.click(load_annotation, [image_state, existing], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
         table.select(
             select_row,
             [table, annotation_state, image_state],
