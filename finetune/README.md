@@ -23,6 +23,24 @@ ein volles Finetuning oder LoRA in bf16.
   einfach ein paar Minuten warten, bis Ollamas Idle-Timeout das Modell von
   selbst entlädt).
 
+## Basismodell wählen (run.bat)
+
+`run.bat`, Punkt 8 ("Finetuning starten") fragt vor dem Start, welches Modell
+trainiert werden soll. `select_model.py` liest dazu die in Ollama installierten
+Modelle (`/api/tags`) und ordnet jedem das Original auf Hugging Face zu, z.B.
+`qwen3-vl:8b` -> `Qwen/Qwen3-VL-8B-Instruct` oder `qwen3-vl:30b-a3b-instruct`
+-> `Qwen/Qwen3-VL-30B-A3B-Instruct` (Download beim ersten Training). Eigene
+Finetunes und Nicht-Qwen-VL-Modelle werden als nicht trainierbar aufgeführt;
+mit `m` lässt sich jedes Hugging-Face-Modell von Hand eingeben.
+
+Neben jedem Modell steht der geschätzte Grafikspeicherbedarf für QLoRA
+(~0,6 GB je Mrd. Parameter + ~3 GB). Auf 12 GB sind 2B, 4B und 8B realistisch;
+30B/32B passen nicht und werden nur nach Rückfrage gestartet. Die Checkpoints
+landen je Modell in einem eigenen Unterordner (`qwen3-vl-8b-handschrift` usw.),
+und Punkt 10 ("Zurück nach Ollama") schlägt den Ollama-Namen passend zu diesem
+Ordner vor. Vor dem Start bietet run.bat außerdem an, im Docker-Container
+`ollama` geladene Modelle zu entladen.
+
 ## 1. Dataset konvertieren
 
 `qwen_export_dataset.py` schreibt Bilder als eigenen Content-Block innerhalb

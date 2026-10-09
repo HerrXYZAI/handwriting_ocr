@@ -186,12 +186,40 @@ if not %errorlevel%==0 (
   echo Docker wurde nicht gefunden. Bitte Docker Desktop installieren und starten.
   goto :done
 )
+rem Basismodell waehlen: finetune\select_model.py fragt die Ollama-Modelle ab,
+rem ordnet ihnen das Hugging-Face-Original zu und schreibt die Wahl als
+rem KEY=VALUE-Zeilen (FT_MODEL, FT_OUTPUT_DIR_CONTAINER) in eine Temp-Datei.
+rem docker compose uebernimmt diese Umgebungsvariablen vor den Werten aus .env.
+set "FT_SELECT_FILE=%TEMP%\handschrift_ft_model.txt"
+if exist "%FT_SELECT_FILE%" del "%FT_SELECT_FILE%"
+"%PYEXE%" finetune\select_model.py "%FT_SELECT_FILE%"
+if not %errorlevel%==0 (
+  echo Abgebrochen.
+  goto :done
+)
+for /f "usebackq tokens=1,* delims==" %%A in ("%FT_SELECT_FILE%") do set "%%A=%%B"
+del "%FT_SELECT_FILE%" >nul 2>nul
 echo.
-echo Baut bei Bedarf das Image und startet das Finetuning im Vordergrund
-echo ^(siehe finetune\^). Mit Strg+C abbrechen.
+echo Von Ollama geladene Modelle belegen Grafikspeicher, der dem Training fehlt.
+set "FT_UNLOAD="
+set /p FT_UNLOAD="Geladene Modelle im Docker-Container 'ollama' jetzt entladen? (J/n): "
+if /i not "%FT_UNLOAD%"=="n" (
+  for /f "skip=1 tokens=1" %%M in ('docker exec ollama ollama ps 2^>nul') do (
+    echo Entlade %%M
+    docker exec ollama ollama stop %%M >nul 2>nul
+  )
+)
+echo.
+echo Baut bei Bedarf das Image und startet das Finetuning von !FT_MODEL! im
+echo Vordergrund ^(siehe finetune\^). Mit Strg+C abbrechen.
+echo Checkpoints: OUTPUT_DIR aus finetune\.env, Unterordner !FT_MODEL_SLUG!-handschrift
 pushd finetune
 docker compose up --build
 popd
+rem Auswahl nicht an spaetere Menuepunkte weiterreichen.
+set "FT_MODEL="
+set "FT_OUTPUT_DIR_CONTAINER="
+set "FT_MODEL_SLUG="
 goto :done
 
 :merge_adapter
@@ -255,8 +283,13 @@ if "%MERGED_REL%"=="" (
   goto :done
 )
 set "MERGED_DIR=!OUTPUT_DIR_ABS!\%MERGED_REL%"
+rem Namensvorschlag aus dem ersten Ordner des Pfads, z.B.
+rem qwen3-vl-8b-handschrift\v4-...\checkpoint-3-merged -> qwen3-vl-8b-handschrift
+set "DEFAULT_OLLAMA_NAME=qwen3-vl-4b-handschrift"
+for /f "tokens=1 delims=\/" %%S in ("%MERGED_REL%") do set "DEFAULT_OLLAMA_NAME=%%S"
 set "OLLAMA_MODEL_NAME="
-set /p OLLAMA_MODEL_NAME="Modellname in Ollama (Enter = qwen3-vl-4b-handschrift): "
+set /p OLLAMA_MODEL_NAME="Modellname in Ollama (Enter = !DEFAULT_OLLAMA_NAME!): "
+if "%OLLAMA_MODEL_NAME%"=="" set "OLLAMA_MODEL_NAME=!DEFAULT_OLLAMA_NAME!"
 set "OLLAMA_QUANT="
 set /p OLLAMA_QUANT="Quantisierung (Enter = Q4_K_M): "
 set "TO_OLLAMA_ARGS=-MergedDir "%MERGED_DIR%""
