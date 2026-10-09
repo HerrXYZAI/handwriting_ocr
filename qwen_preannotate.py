@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -675,33 +676,293 @@ def split_text_lines(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"\r\n|\r|\n|\\n", text) if part.strip()]
 
 
-# Bis zu diesem Winkel (Grad) wird eine Box zum Aufteilen als waagerecht
-# behandelt. Stärker gedrehte Boxen bleiben unverändert, weil eine senkrechte
-# Teilung der ungedrehten Box dort nicht zu den Zeilen passt.
+# Bis zu diesem Winkel (Grad) gilt eine Box als achsenparallel. Bei stärker
+# gedrehten Boxen (Modell hat "angle" gesetzt) wird im eigenen, ungedrehten
+# Koordinatensystem der Box geteilt und die Teilboxen werden um den
+# Mittelpunkt der Ausgangsbox zurückgedreht.
 SPLIT_MAX_ANGLE = 15.0
+# Kantenlänge, auf die der Boxausschnitt für die Zeilenanalyse verkleinert wird.
+_ANALYSIS_MAX_SIDE = 400
+
+
+def _otsu_threshold(gray: Image.Image) -> int:
+    """Schwellwert zwischen Schrift und Papier nach Otsu (Graustufenbild)."""
+    hist = gray.histogram()[:256]
+    total = sum(hist)
+    sum_all = sum(i * h for i, h in enumerate(hist))
+    weight_bg = 0
+    sum_bg = 0.0
+    best_var = -1.0
+    threshold = 128
+    for value in range(256):
+        weight_bg += hist[value]
+        if weight_bg == 0:
+            continue
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+        sum_bg += value * hist[value]
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_all - sum_bg) / weight_fg
+        between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if between > best_var:
+            best_var = between
+            threshold = value
+    return threshold
+
+
+class _InkMap:
+    """Binäre Schriftmaske eines (verkleinerten) Ausschnitts mit Zeilen- und
+    Spaltensummen. ok ist False, wenn sich Schrift und Papier nicht sinnvoll
+    trennen lassen (leerer oder fast schwarzer Ausschnitt)."""
+
+    def __init__(self, region: Image.Image) -> None:
+        gray = ImageOps.grayscale(region)
+        factor = min(1.0, _ANALYSIS_MAX_SIDE / max(gray.size))
+        if factor < 1.0:
+            gray = gray.resize(
+                (max(1, round(gray.width * factor)), max(1, round(gray.height * factor))),
+                Image.Resampling.BILINEAR,
+            )
+        self.width, self.height = gray.size
+        threshold = _otsu_threshold(gray)
+        data = list(gray.getdata())
+        self.mask = [
+            [1 if data[row * self.width + col] <= threshold else 0 for col in range(self.width)]
+            for row in range(self.height)
+        ]
+        self.rows = [sum(row) for row in self.mask]
+        self.cols = [sum(self.mask[row][col] for row in range(self.height)) for col in range(self.width)]
+        ink = sum(self.rows) / max(1, self.width * self.height)
+        self.ok = self.width >= 8 and self.height >= 8 and 0.002 <= ink <= 0.5
+
+
+def _periodicity(profile: list[int], line_count: int) -> float:
+    """Stärke einer Wiederholung mit etwa line_count Perioden im Profil
+    (Zeilen und Zwischenräume ergeben eine fast regelmäßige Welle)."""
+    length = len(profile)
+    total = sum(profile)
+    if length < 8 or total <= 0:
+        return 0.0
+    mean = total / length
+    centered = [value - mean for value in profile]
+    best = 0.0
+    for k in range(max(2, int(line_count * 0.6)), int(line_count * 1.6) + 2):
+        if k >= length / 2:
+            break
+        real = sum(c * math.cos(2 * math.pi * k * i / length) for i, c in enumerate(centered))
+        imag = sum(c * math.sin(2 * math.pi * k * i / length) for i, c in enumerate(centered))
+        best = max(best, math.hypot(real, imag))
+    return best / total
+
+
+def _smooth(profile: list[int], radius: int) -> list[float]:
+    if radius <= 0:
+        return [float(v) for v in profile]
+    result = []
+    for i in range(len(profile)):
+        window = profile[max(0, i - radius):i + radius + 1]
+        result.append(sum(window) / len(window))
+    return result
+
+
+def _line_boundaries(profile: list[int], line_count: int) -> list[float]:
+    """Grenzen zwischen den line_count Zeilen als Anteile 0..1 entlang des
+    Profils (Index 0 = Lesebeginn). Erst werden die Schriftzeilen als
+    zusammenhängende Abschnitte mit Tinte erkannt; gibt es zu viele, werden
+    die durch die kleinste Lücke getrennten zusammengelegt (z.B. Ober-/
+    Unterlängen, Flecken), gibt es zu wenige (sich berührende Zeilen), wird
+    der längste Abschnitt an seiner schriftärmsten Stelle geteilt.
+    Geschnitten wird jeweils in der Mitte der Lücke zwischen zwei Zeilen.
+    Ohne verwertbares Profil wird gleichmäßig geteilt."""
+    even = [j / line_count for j in range(line_count + 1)]
+    if not profile or sum(profile) <= 0:
+        return even
+    length = len(profile)
+    smooth = _smooth(profile, max(1, round(length / line_count / 25)))
+    peak = max(smooth)
+    if peak <= 0:
+        return even
+    threshold = peak * 0.1
+    runs: list[list[int]] = []
+    for index, value in enumerate(smooth):
+        if value > threshold:
+            if runs and runs[-1][1] == index:
+                runs[-1][1] = index + 1
+            else:
+                runs.append([index, index + 1])
+    if not runs:
+        return even
+    while len(runs) > line_count:
+        gap_index = min(range(len(runs) - 1), key=lambda i: runs[i + 1][0] - runs[i][1])
+        runs[gap_index][1] = runs[gap_index + 1][1]
+        del runs[gap_index + 1]
+    while len(runs) < line_count:
+        widest = max(range(len(runs)), key=lambda i: runs[i][1] - runs[i][0])
+        run_start, run_end = runs[widest]
+        if run_end - run_start < 4:
+            return even
+        inner_start = run_start + (run_end - run_start) // 5
+        inner_end = run_end - (run_end - run_start) // 5
+        cut = min(range(inner_start, inner_end), key=lambda i: smooth[i])
+        runs[widest:widest + 1] = [[run_start, cut], [cut, run_end]]
+    cuts = [(runs[i][1] + runs[i + 1][0]) / 2 for i in range(line_count - 1)]
+    return [0.0] + [cut / length for cut in cuts] + [1.0]
+
+
+def _vertical_reading_start(ink: _InkMap, bounds: list[float]) -> str | None:
+    """Für senkrecht verlaufende Zeilen: Beginnen die Zeilen oben (Seite im
+    Uhrzeigersinn gedreht, erste Zeile rechts) oder unten (gegen den
+    Uhrzeigersinn, erste Zeile links)? Handschrift ist meist links
+    ausgerichtet, d.h. die Zeilenanfänge liegen auf einer Linie und die
+    Zeilenenden flattern. Liefert "top", "bottom" oder None (unklar)."""
+    tops: list[int] = []
+    bottoms: list[int] = []
+    for left, right in zip(bounds, bounds[1:]):
+        c1, c2 = int(left * ink.width), max(int(left * ink.width) + 1, int(right * ink.width))
+        minimum = max(1, (c2 - c1) // 20)
+        rows = [r for r in range(ink.height) if sum(ink.mask[r][c1:c2]) >= minimum]
+        if rows:
+            tops.append(rows[0])
+            bottoms.append(rows[-1])
+    if len(tops) < 3:
+        return None
+
+    def spread(values: list[int]) -> float:
+        mean = sum(values) / len(values)
+        return math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
+
+    top_spread, bottom_spread = spread(tops), spread(bottoms)
+    if top_spread < 0.7 * bottom_spread:
+        return "top"
+    if bottom_spread < 0.7 * top_spread:
+        return "bottom"
+    return None
+
+
+def _chunk_ranges(bounds: list[float], line_count: int, max_lines: int) -> list[tuple[int, float, float]]:
+    """(erster Zeilenindex, Anfang, Ende) je Teilbox als Anteile 0..1."""
+    return [
+        (start, bounds[start], bounds[min(line_count, start + max_lines)])
+        for start in range(0, line_count, max_lines)
+    ]
 
 
 def split_block(
-    bbox: list[int], text: str, angle: float = 0.0, max_lines: int = MAX_LINES_PER_BOX
+    bbox: list[int],
+    text: str,
+    angle: float = 0.0,
+    max_lines: int = MAX_LINES_PER_BOX,
+    image: Image.Image | None = None,
 ) -> list[tuple[list[int], str]]:
-    """Teilt eine 0-1000-Box mit mehr als max_lines Textzeilen senkrecht in
-    gleich hohe Teilboxen mit je höchstens max_lines Zeilen. Ohne
-    Zeilenumbrüche im Text bleibt die Box unverändert."""
+    """Teilt eine 0-1000-Box mit mehr als max_lines Textzeilen (erkennbar an
+    den Zeilenumbrüchen im Text) in Teilboxen mit je höchstens max_lines
+    Zeilen. Ohne Zeilenumbrüche bleibt die Box unverändert.
+
+    image ist das Bild, auf das sich bbox bezieht (Seite bzw. Kachel). Damit
+    wird erkannt, ob die Zeilen waagerecht oder - bei um 90° gedrehten
+    Seiten - senkrecht verlaufen, und es wird an den Lücken zwischen den
+    Zeilen geschnitten statt in gleich großen Stücken. Ohne Bild wird
+    gleichmäßig und waagerecht geteilt.
+    """
     lines = split_text_lines(text)
-    if len(lines) <= max_lines or abs(angle) > SPLIT_MAX_ANGLE:
+    if len(lines) <= max_lines:
         return [(list(bbox), "\n".join(lines) if lines else text)]
-    x1, y1, x2, y2 = bbox
-    height = y2 - y1
-    total = len(lines)
+    count = len(lines)
+    page_w, page_h = image.size if image is not None else (1000, 1000)
+    sx, sy = page_w / 1000, page_h / 1000
+    x1, y1, x2, y2 = (bbox[0] * sx, bbox[1] * sy, bbox[2] * sx, bbox[3] * sy)
+    cx, cy, w, h = (x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1
+
+    def to_1000(px1: float, py1: float, px2: float, py2: float) -> list[int]:
+        box = [
+            clamp(round(px1 / sx), 0, 1000), clamp(round(py1 / sy), 0, 1000),
+            clamp(round(px2 / sx), 0, 1000), clamp(round(py2 / sy), 0, 1000),
+        ]
+        if box[2] <= box[0]:
+            box[2] = min(1000, box[0] + 1)
+        if box[3] <= box[1]:
+            box[3] = min(1000, box[1] + 1)
+        return box
+
     parts: list[tuple[list[int], str]] = []
-    for start in range(0, total, max_lines):
-        chunk = lines[start:start + max_lines]
-        part_y1 = y1 + round(height * start / total)
-        part_y2 = y1 + round(height * (start + len(chunk)) / total)
-        if part_y2 <= part_y1:
-            part_y2 = min(1000, part_y1 + 1)
-        parts.append(([x1, part_y1, x2, part_y2], "\n".join(chunk)))
+
+    if abs(angle) > SPLIT_MAX_ANGLE:
+        # Gedrehte Box: Zeilen laufen im ungedrehten Rahmen der Box waagerecht.
+        profile: list[int] = []
+        if image is not None:
+            rx1, ry1, rx2, ry2 = _rotated_bounds(cx, cy, w, h, angle)
+            region = image.crop((int(rx1), int(ry1), int(math.ceil(rx2)), int(math.ceil(ry2))))
+            upright = region.rotate(angle, expand=True)
+            left, top = (upright.width - w) / 2, (upright.height - h) / 2
+            upright = upright.crop((int(left), int(top), int(left + w), int(top + h)))
+            ink = _InkMap(upright) if upright.width > 0 and upright.height > 0 else None
+            if ink is not None and ink.ok:
+                profile = ink.rows
+        bounds = _line_boundaries(profile, count)
+        rad = math.radians(angle)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        for start, a, b in _chunk_ranges(bounds, count, max_lines):
+            dy = (a + b) / 2 * h - h / 2
+            ncx, ncy = cx - dy * sin_a, cy + dy * cos_a
+            part_h = (b - a) * h
+            parts.append((
+                to_1000(ncx - w / 2, ncy - part_h / 2, ncx + w / 2, ncy + part_h / 2),
+                "\n".join(lines[start:start + max_lines]),
+            ))
+        return parts
+
+    orientation, reading_start = "horizontal", None
+    ink = None
+    if image is not None:
+        region = image.crop((int(x1), int(y1), int(math.ceil(x2)), int(math.ceil(y2))))
+        if region.width > 0 and region.height > 0:
+            ink = _InkMap(region)
+        if ink is not None and ink.ok:
+            row_score, col_score = _periodicity(ink.rows, count), _periodicity(ink.cols, count)
+            if col_score > 1.2 * row_score:
+                orientation = "vertical"
+            LOG.debug("Zeilenrichtung: Zeilen %.3f, Spalten %.3f -> %s", row_score, col_score, orientation)
+        else:
+            ink = None
+
+    if orientation == "horizontal":
+        bounds = _line_boundaries(ink.rows if ink else [], count)
+        for start, a, b in _chunk_ranges(bounds, count, max_lines):
+            parts.append((to_1000(x1, y1 + a * h, x2, y1 + b * h), "\n".join(lines[start:start + max_lines])))
+        return parts
+
+    # Senkrechte Zeilen (um 90° gedrehte Seite): Lesebeginn bestimmen und
+    # Spalten von dort aus zuordnen. Unklar -> wie im Uhrzeigersinn gedreht
+    # (erste Zeile rechts).
+    assert ink is not None
+    left_to_right = _line_boundaries(ink.cols, count)
+    reading_start = _vertical_reading_start(ink, left_to_right)
+    from_left = reading_start == "bottom"
+    profile = ink.cols if from_left else list(reversed(ink.cols))
+    bounds = _line_boundaries(profile, count)
+    LOG.info(
+        "Senkrechte Textzeilen erkannt (gedrehte Seite); Lesebeginn %s - Box wird in Spalten geteilt",
+        {"top": "oben, erste Zeile rechts", "bottom": "unten, erste Zeile links"}.get(
+            reading_start or "", "unklar, erste Zeile rechts angenommen"
+        ),
+    )
+    for start, a, b in _chunk_ranges(bounds, count, max_lines):
+        if from_left:
+            px1, px2 = x1 + a * w, x1 + b * w
+        else:
+            px1, px2 = x2 - b * w, x2 - a * w
+        parts.append((to_1000(px1, y1, px2, y2), "\n".join(lines[start:start + max_lines])))
     return parts
+
+
+def _rotated_bounds(cx: float, cy: float, w: float, h: float, angle_degrees: float) -> tuple[float, float, float, float]:
+    """Achsenparallele Hülle eines um (cx, cy) im Uhrzeigersinn gedrehten Rechtecks."""
+    rad = math.radians(angle_degrees)
+    cos_a, sin_a = abs(math.cos(rad)), abs(math.sin(rad))
+    half_w = (w * cos_a + h * sin_a) / 2
+    half_h = (w * sin_a + h * cos_a) / 2
+    return cx - half_w, cy - half_h, cx + half_w, cy + half_h
 
 
 def local_bbox_to_pixels(local_bbox: list[int], width: int, height: int) -> list[int]:
@@ -750,7 +1011,7 @@ def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
             angle = float(raw_line.get("angle", 0))
         except (TypeError, ValueError):
             angle = 0.0
-        parts = split_block(local_bbox, text, angle, max_lines)
+        parts = split_block(local_bbox, text, angle, max_lines, tile.image)
         if len(parts) > 1:
             split_count += 1
             LOG.info(

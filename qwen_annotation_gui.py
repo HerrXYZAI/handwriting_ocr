@@ -290,7 +290,10 @@ def pixels_to_bbox_1000(pixel_box: list[int], width: int, height: int) -> list[i
     ]
 
 
-def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
+def normalize_annotation(data: dict[str, Any], image: Image.Image | None = None) -> dict[str, Any]:
+    """image: der Scan, auf den sich bbox_1000 bezieht - damit erkennt
+    qwen_preannotate.split_block() auch senkrecht verlaufende Zeilen
+    (um 90° gedrehte Seiten)."""
     raw_lines = data.get("lines")
     if not isinstance(raw_lines, list):
         raise ValueError('Qwen-Ausgabe enthält keine Liste "lines".')
@@ -314,7 +317,9 @@ def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
         angle = normalize_angle(item.get("angle", 0))
         # Blöcke mit mehr als MAX_LINES_PER_BOX Textzeilen (z.B. eine einzige
         # Box für die ganze Seite) anhand der Zeilenumbrüche aufteilen.
-        for part_bbox, part_text in qwen_preannotate.split_block(bbox, text, angle):
+        for part_bbox, part_text in qwen_preannotate.split_block(
+            bbox, text, angle, qwen_preannotate.MAX_LINES_PER_BOX, image
+        ):
             result.append({
                 "id": "",
                 "bbox_1000": part_bbox,
@@ -431,7 +436,7 @@ def run_qwen(image_path: str, model: str, context_size: int) -> dict[str, Any]:
         raw = _run_qwen_llamacpp(path)
     else:
         raw = _run_qwen_ollama(path, model, context_size)
-    return normalize_annotation(extract_json(raw))
+    return normalize_annotation(extract_json(raw), open_scan(path))
 
 
 def _run_qwen_ollama(path: Path, model: str, context_size: int) -> str:
