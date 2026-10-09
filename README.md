@@ -236,6 +236,10 @@ Vorannotationen).
   nicht akzeptiert, blau = ausgewählt. Die Modell-Konfidenz steht im Mouse-over-Hinweis.
   Der Schalter **"Akzeptierte Boxen ausblenden"** blendet erledigte Boxen aus; "akzeptieren"
   springt dann zur nächsten noch nicht akzeptierten Zeile.
+  **"Bedienelemente ausblenden (Übersicht)"** zeigt nur noch die Rechtecke – ohne ✓/✗,
+  Griffe, Nummern und Textfeld an der Box. Ein Klick wählt weiterhin eine Zeile aus
+  (Korrektur dann im Feld unter "Ausgewählte Zeile"), Verschieben ist in diesem Modus
+  gesperrt; der erkannte Text erscheint beim Überfahren mit der Maus.
 - **"⏭ Überspringen"** (zwischen den beiden Knöpfen) lässt den Prüfstatus unverändert und
   geht zur nächsten Zeile; eine bereits getippte Korrektur wird dabei übernommen.
 - Tabelle: Spalte "Prüfung" (`✓ ok` / `✗ nein` / `offen`, von Hand auch `ok`, `x`,
