@@ -11,3 +11,4 @@ install.txt
 pictures_for_OCR/
 finetune/output/
 finetune/.packages_refresh
+.last_preannotate_model

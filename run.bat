@@ -98,14 +98,25 @@ if "%INPUT_PATH%"=="" (
   echo Kein Pfad angegeben.
   goto :done
 )
+rem Modell aus der Liste der installierten Ollama-Modelle waehlen; das zuletzt
+rem genutzte ist vorausgewaehlt (gemerkt in .last_preannotate_model).
+set "PRE_SELECT_FILE=%TEMP%\handschrift_preannotate_model.txt"
+if exist "%PRE_SELECT_FILE%" del "%PRE_SELECT_FILE%"
+"%PYEXE%" select_ollama_model.py "%PRE_SELECT_FILE%"
+if not %errorlevel%==0 (
+  echo Abgebrochen.
+  goto :done
+)
+set "PRE_MODEL="
+set /p PRE_MODEL=<"%PRE_SELECT_FILE%"
+del "%PRE_SELECT_FILE%" >nul 2>nul
 echo.
-echo Optionale zusaetzliche Argumente, z.B. --model qwen3-vl:4b --verbose
-echo Groesseres Modell (12 GB VRAM + 32 GB RAM, langsamer, genauer^):
-echo   --model qwen3-vl:30b-a3b-instruct --max-side 1536 --ctx 12288 --no-mmap
+echo Optionale zusaetzliche Argumente, z.B. --verbose
+echo Fuer grosse Modelle (z.B. 30B auf 12 GB VRAM^): --max-side 1536 --ctx 12288 --no-mmap
 echo (Liste aller Optionen: qwen_preannotate.py --help^). Leer lassen fuer Standard.
 set "EXTRA_ARGS="
 set /p EXTRA_ARGS="Zusaetzliche Optionen: "
-"%PYEXE%" qwen_preannotate.py "%INPUT_PATH%" %EXTRA_ARGS%
+"%PYEXE%" qwen_preannotate.py "%INPUT_PATH%" --model "%PRE_MODEL%" %EXTRA_ARGS%
 goto :done
 
 :export
