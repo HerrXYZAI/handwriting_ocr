@@ -68,6 +68,11 @@ Gib ausschließlich gültiges JSON in diesem Format zurück:
 
 {"lines": [{"bbox_1000": [x1, y1, x2, y2], "text": "erkannter Text", "confidence": "high"}]}
 
+WICHTIG: Jeder Eintrag in "lines" umfasst höchstens 3 aufeinanderfolgende
+Textzeilen, am besten genau eine. Eine einzige Box für die ganze Seite oder
+für einen ganzen Absatz ist NICHT erlaubt; eine Seite mit 20 Textzeilen ergibt
+also mindestens 7, besser 20 Einträge. Fasst ein Eintrag ausnahmsweise mehrere
+Zeilen zusammen, trenne sie im Feld "text" mit \\n.
 Die Koordinaten müssen auf 0 bis 1000 normalisiert sein. bbox_1000 beschreibt
 die Box ungedreht (x2-x1 und y2-y1 sind Breite und Höhe um den Mittelpunkt der
 Box). Ist eine Zeile spürbar gedreht/schräg geschrieben (z.B. eine senkrechte
@@ -75,7 +80,7 @@ Randnotiz oder ein schräg aufgeklebter Stempel), ergänze zusätzlich "angle" i
 Grad im Uhrzeigersinn, z.B. 90 für eine Zeile, die von oben nach unten läuft,
 -90 für von unten nach oben, oder ein kleiner Wert wie 8 für nur leicht
 schräg geschriebenen Text; bei normal ausgerichtetem Text "angle" ganz
-weglassen. Jede Textzeile erhält eine eigene, möglichst eng anliegende Box
+weglassen. Jeder Eintrag erhält eine eigene, möglichst eng anliegende Box
 (um die ungedrehte Ausrichtung, nicht um die gedrehte). Ergänze keine
 unsichtbaren Wörter. Zahlen, Namen und Einheiten nicht plausibilisieren. Unleserliches als
 [unleserlich], unsichere Wörter mit [?]. Ignoriere automatisch vom Scanner
@@ -98,7 +103,8 @@ Erläuterungen ausgeben.
 TRAINING_PROMPT = """
 Erkenne alle handschriftlichen deutschen Textzeilen auf dieser Seite.
 Gib ausschließlich gültiges JSON mit einer Liste namens lines aus. Jeder
-Eintrag enthält bbox_1000 als [x1,y1,x2,y2] und text. Die Koordinaten sind auf
+Eintrag enthält bbox_1000 als [x1,y1,x2,y2] und text und umfasst höchstens
+3 Textzeilen (getrennt durch \\n), am besten genau eine. Die Koordinaten sind auf
 0 bis 1000 normalisiert und beschreiben die Box ungedreht. Ist eine Zeile
 spürbar gedreht/schräg geschrieben, ergänze zusätzlich "angle" in Grad im
 Uhrzeigersinn (weglassen bei normal ausgerichtetem Text). Sortiere in
@@ -305,16 +311,20 @@ def normalize_annotation(data: dict[str, Any]) -> dict[str, Any]:
         confidence = str(item.get("confidence", "low")).lower().strip()
         if confidence not in CONFIDENCE_VALUES:
             confidence = "low"
-        result.append({
-            "id": "",
-            "bbox_1000": bbox,
-            "text_predicted": text,
-            "text_corrected": text,
-            "confidence": confidence,
-            "status": "unreviewed",
-            "review": review.OPEN,
-            "angle": normalize_angle(item.get("angle", 0)),
-        })
+        angle = normalize_angle(item.get("angle", 0))
+        # Blöcke mit mehr als MAX_LINES_PER_BOX Textzeilen (z.B. eine einzige
+        # Box für die ganze Seite) anhand der Zeilenumbrüche aufteilen.
+        for part_bbox, part_text in qwen_preannotate.split_block(bbox, text, angle):
+            result.append({
+                "id": "",
+                "bbox_1000": part_bbox,
+                "text_predicted": part_text,
+                "text_corrected": part_text,
+                "confidence": confidence,
+                "status": "unreviewed",
+                "review": review.OPEN,
+                "angle": angle,
+            })
     result.sort(key=lambda x: (x["bbox_1000"][1], x["bbox_1000"][0]))
     for number, item in enumerate(result, 1):
         item["id"] = f"line_{number:04d}"

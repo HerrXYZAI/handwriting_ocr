@@ -28,6 +28,11 @@ DEFAULT_MODEL = "qwen3-vl:4b"
 DEFAULT_CONTEXT = 8192
 DEFAULT_MAX_SIDE = 1024
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
+# Höchstens so viele Textzeilen je Box. Liefert das Modell größere Blöcke
+# (z.B. qwen3.5:9b gern eine einzige Box für die ganze Seite), werden sie in
+# split_block() anhand der Zeilenumbrüche im Text aufgeteilt. Die Zahl steht
+# zusätzlich wörtlich in PROMPT bzw. in den Prompts von qwen_annotation_gui.py.
+MAX_LINES_PER_BOX = 3
 
 PROMPT = """
 Analysiere diesen Bildausschnitt einer gescannten Seite mit deutscher Handschrift.
@@ -35,11 +40,16 @@ Erkenne alle vollständig oder teilweise sichtbaren handschriftlichen Textzeilen
 Gib ausschließlich gültiges JSON in diesem Format zurück:
 {"lines":[{"bbox_1000":[x1,y1,x2,y2],"text":"erkannter Text","confidence":"high"}]}
 
+WICHTIG: Jeder Eintrag in "lines" umfasst höchstens 3 aufeinanderfolgende
+Textzeilen, am besten genau eine. Eine einzige Box für den ganzen Ausschnitt
+oder für einen ganzen Absatz ist NICHT erlaubt; 20 Textzeilen ergeben also
+mindestens 7, besser 20 Einträge. Fasst ein Eintrag ausnahmsweise mehrere
+Zeilen zusammen, trenne sie im Feld "text" mit \\n.
 Die Koordinaten beziehen sich ausschließlich auf den übergebenen Bildausschnitt
 und sind auf 0 bis 1000 normalisiert und beschreiben die Box ungedreht. Ist
 eine Zeile spürbar gedreht/schräg geschrieben (z.B. eine senkrechte
 Randnotiz), ergänze zusätzlich "angle" in Grad im Uhrzeigersinn (weglassen
-bei normal ausgerichtetem Text). Die Box soll die gesamte sichtbare Zeile
+bei normal ausgerichtetem Text). Die Box soll nur die Zeilen ihres Eintrags
 möglichst eng umschließen. Sortiere von oben nach unten, dann von links nach
 rechts. Ergänze keine nicht sichtbaren Wörter. Zahlen, Namen und Einheiten nicht
 plausibilisieren. Unleserliches als [unleserlich], Unsicheres mit [?] markieren.
@@ -660,6 +670,40 @@ def _call_llamacpp(
     return extract_json(raw_content)
 
 
+def split_text_lines(text: str) -> list[str]:
+    """Trennt an echten Zeilenumbrüchen und an wörtlich ausgegebenem \\n."""
+    return [part.strip() for part in re.split(r"\r\n|\r|\n|\\n", text) if part.strip()]
+
+
+# Bis zu diesem Winkel (Grad) wird eine Box zum Aufteilen als waagerecht
+# behandelt. Stärker gedrehte Boxen bleiben unverändert, weil eine senkrechte
+# Teilung der ungedrehten Box dort nicht zu den Zeilen passt.
+SPLIT_MAX_ANGLE = 15.0
+
+
+def split_block(
+    bbox: list[int], text: str, angle: float = 0.0, max_lines: int = MAX_LINES_PER_BOX
+) -> list[tuple[list[int], str]]:
+    """Teilt eine 0-1000-Box mit mehr als max_lines Textzeilen senkrecht in
+    gleich hohe Teilboxen mit je höchstens max_lines Zeilen. Ohne
+    Zeilenumbrüche im Text bleibt die Box unverändert."""
+    lines = split_text_lines(text)
+    if len(lines) <= max_lines or abs(angle) > SPLIT_MAX_ANGLE:
+        return [(list(bbox), "\n".join(lines) if lines else text)]
+    x1, y1, x2, y2 = bbox
+    height = y2 - y1
+    total = len(lines)
+    parts: list[tuple[list[int], str]] = []
+    for start in range(0, total, max_lines):
+        chunk = lines[start:start + max_lines]
+        part_y1 = y1 + round(height * start / total)
+        part_y2 = y1 + round(height * (start + len(chunk)) / total)
+        if part_y2 <= part_y1:
+            part_y2 = min(1000, part_y1 + 1)
+        parts.append(([x1, part_y1, x2, part_y2], "\n".join(chunk)))
+    return parts
+
+
 def local_bbox_to_pixels(local_bbox: list[int], width: int, height: int) -> list[int]:
     """Rechnet eine 0-1000-normalisierte Box in Originalpixel der Kachel um."""
     x1, y1, x2, y2 = local_bbox
@@ -685,7 +729,9 @@ def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
         raise ValueError('Antwort enthält keine Liste "lines".')
 
     tile_width, tile_height = tile.image.size
+    max_lines = getattr(args, "max_lines", MAX_LINES_PER_BOX)
     lines: list[dict[str, Any]] = []
+    split_count = 0
     for raw_line in raw_lines:
         if not isinstance(raw_line, dict):
             continue
@@ -704,15 +750,32 @@ def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
             angle = float(raw_line.get("angle", 0))
         except (TypeError, ValueError):
             angle = 0.0
-        lines.append({
-            "id": "",
-            "bbox_pixels": local_bbox_to_pixels(local_bbox, tile_width, tile_height),
-            "bbox_1000": local_bbox,
-            "text": text,
-            "confidence": confidence,
-            "angle": angle,
-        })
-    LOG.info("Abschnitt %d: %d gültige Zeilen übernommen", tile.index, len(lines))
+        parts = split_block(local_bbox, text, angle, max_lines)
+        if len(parts) > 1:
+            split_count += 1
+            LOG.info(
+                "Box mit %d Textzeilen in %d Teilboxen aufgeteilt",
+                len(split_text_lines(text)), len(parts),
+            )
+        for part_bbox, part_text in parts:
+            lines.append({
+                "id": "",
+                "bbox_pixels": local_bbox_to_pixels(part_bbox, tile_width, tile_height),
+                "bbox_1000": part_bbox,
+                "text": part_text,
+                "confidence": confidence,
+                "angle": angle,
+            })
+    LOG.info(
+        "Abschnitt %d: %d gültige Boxen übernommen (%d große Boxen aufgeteilt)",
+        tile.index, len(lines), split_count,
+    )
+    if len(lines) == 1 and len(raw_lines) == 1:
+        LOG.warning(
+            "Abschnitt %d: Das Modell hat nur eine Box ohne Zeilenumbrüche geliefert - "
+            "Ergebnis prüfen (ggf. kleinere Kacheln oder ein Qwen3-VL-Modell verwenden).",
+            tile.index,
+        )
     return lines
 
 
@@ -753,6 +816,7 @@ def build_processing_block(args: argparse.Namespace, log_file: Path, tile_count:
         "no_mmap": args.no_mmap,
         "json_mode": args.json_mode,
         "max_model_image_side": args.max_side,
+        "max_lines_per_box": getattr(args, "max_lines", MAX_LINES_PER_BOX),
         "tile_trigger": args.tile_trigger,
         "tile_size": args.tile_size,
         "tile_overlap": args.overlap,
@@ -1096,6 +1160,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"API-URL; Standard je Backend: ollama={OLLAMA_API}, llamacpp={LLAMACPP_API}",
     )
     parser.add_argument("--max-side", type=positive_int, default=DEFAULT_MAX_SIDE, help=f"Maximale Seitenlänge je Modellbild; Standard: {DEFAULT_MAX_SIDE}")
+    parser.add_argument("--max-lines", type=positive_int, default=MAX_LINES_PER_BOX, help=f"Maximale Textzeilen je Box; größere Boxen werden anhand der Zeilenumbrüche im Text aufgeteilt; Standard: {MAX_LINES_PER_BOX}")
     parser.add_argument(
         "--tile-trigger",
         type=positive_int,
