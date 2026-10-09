@@ -580,7 +580,7 @@ body.qb-hide-controls .bbox-box { cursor: pointer; }
 .bbox-box:hover .bbox-tip { display: block; }
 .bbox-textarea { width: 100%; min-height: 60px; font-size: 14px; padding: 6px; border: 2px solid #0067C0; border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,.25); resize: vertical; font-family: inherit; box-sizing: border-box; }
 .bbox-empty { padding: 40px; text-align: center; color: #888; }
-#bbox-sync-box, #file-sync-box-all, #file-sync-box-flagged { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; opacity: 0 !important; pointer-events: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; }
+#bbox-sync-box, #file-sync-box-all, #file-sync-box-flagged, #delete-pre-target, #delete-pre-confirm { position: absolute !important; width: 1px !important; height: 1px !important; overflow: hidden !important; opacity: 0 !important; pointer-events: none !important; margin: 0 !important; padding: 0 !important; border: 0 !important; }
 .file-list { max-height: 260px; overflow-y: auto; border: 1px solid #ddd; border-radius: 6px; }
 .file-list-empty { padding: 16px; text-align: center; color: #888; }
 .file-row { display: flex; align-items: center; gap: 8px; padding: 6px 10px; cursor: pointer; border-bottom: 1px solid #eee; font-size: 13px; }
@@ -1611,6 +1611,56 @@ def refresh_annotation_sources(image_path: str | None, selected: str | None = No
     values = [value for _, value in choices]
     value = selected if selected in values else default
     return gr.update(choices=choices, value=value)
+
+
+# Bestätigungsdialog vor dem Löschen der Vorannotation. Bekommt den Pfad der
+# aktuell geladenen Datei (verstecktes Feld delete-pre-target) und schreibt bei
+# "OK" "<pfad>|<zeitstempel>" in das versteckte Feld delete-pre-confirm, dessen
+# .change() dann delete_preannotation() auslöst; bei "Abbrechen" einen leeren
+# Wert. Der Zeitstempel sorgt dafür, dass auch wiederholtes Löschen derselben
+# Datei ein Änderungsereignis erzeugt.
+DELETE_PREANNOTATION_JS = r"""
+(path) => {
+  if (!path) {
+    alert('Keine Datei geladen.');
+    return '';
+  }
+  const name = path.split(/[\\/]/).pop();
+  const stem = name.replace(/\.[^.]*$/, '');
+  const ok = confirm(
+    'Vorannotation wirklich löschen?\n\n' + stem + '_preannotation.json\n\n' +
+    'Alle darin gespeicherten Modellläufe gehen verloren. Eine geprüfte ' +
+    'Annotation (_annotation.json) bleibt erhalten. Das kann nicht ' +
+    'rückgängig gemacht werden.'
+  );
+  return ok ? path + '|' + Date.now() : '';
+}
+"""
+
+
+def delete_preannotation(token: str, image_path: str | None, dataset_root: str):
+    """Löscht <bild>_preannotation.json der aktuell geladenen Datei, nachdem
+    der Bestätigungsdialog (DELETE_PREANNOTATION_JS) mit OK beantwortet wurde.
+    Gibt es keine geprüfte Annotation, stammte die Anzeige aus der gelöschten
+    Datei und wird geleert; sonst bleibt sie unverändert."""
+    unchanged = (gr.skip(),) * 7
+    if not token:
+        return (*unchanged, gr.skip(), gr.skip(), gr.skip())
+    requested = token.rsplit("|", 1)[0]
+    if not image_path or requested != image_path:
+        raise gr.Error("Die Auswahl hat sich inzwischen geändert - bitte erneut versuchen.")
+    annotation_path, preannotation_path = _source_files(image_path)
+    if not preannotation_path.is_file():
+        return (*unchanged, gr.skip(), gr.skip(), f"Keine Vorannotation vorhanden: {preannotation_path.name}")
+    try:
+        preannotation_path.unlink()
+    except OSError as exc:
+        raise gr.Error(f"Löschen fehlgeschlagen: {exc}") from exc
+    all_html, flagged_html = render_file_lists(dataset_root, image_path)
+    note = f"Vorannotation gelöscht: {preannotation_path}"
+    if annotation_path.is_file():
+        return (*unchanged, all_html, flagged_html, note + " (geprüfte Annotation bleibt angezeigt)")
+    return ({}, -1, EMPTY_PREVIEW_HTML, None, [], None, None, all_html, flagged_html, note)
 
 
 def _run_as_annotation(run: dict[str, Any], image: dict[str, Any] | None) -> dict[str, Any]:
@@ -2835,6 +2885,11 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                             refresh_models_button = gr.Button("🔄", scale=1, min_width=40)
                         context = gr.Number(label="Kontextgröße", value=DEFAULT_CONTEXT_SIZE, precision=0)
                         preannotate = gr.Button("Qwen-Vorannotation starten", variant="primary")
+                        delete_pre_button = gr.Button("🗑 Vorannotation dieser Datei löschen", variant="stop")
+                        # Versteckte Hilfsfelder für den Bestätigungsdialog
+                        # (per CSS ausgeblendet, siehe bbox_sync).
+                        delete_pre_target = gr.Textbox(elem_id="delete-pre-target", visible=True, container=False)
+                        delete_pre_confirm = gr.Textbox(elem_id="delete-pre-confirm", visible=True, container=False)
                         with gr.Row():
                             tesseract_lang = gr.Textbox(label="Tesseract-Sprache", value=tesseract_boxes.DEFAULT_LANG)
                             tesseract_psm = gr.Number(label="Tesseract PSM", value=tesseract_boxes.DEFAULT_PSM, precision=0)
@@ -2933,6 +2988,16 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
         # damit nur eine echte Auswahl durch den Benutzer neu lädt, nicht das
         # programmgesteuerte Setzen des Werts.
         image_state.change(refresh_annotation_sources, [image_state], source_select)
+        image_state.change(lambda path: path or "", [image_state], delete_pre_target, show_progress="hidden")
+        delete_pre_button.click(None, [delete_pre_target], [delete_pre_confirm], js=DELETE_PREANNOTATION_JS)
+        delete_pre_confirm.change(
+            delete_preannotation,
+            [delete_pre_confirm, image_state, dataset_root],
+            [
+                annotation_state, selected_state, preview, crop, table, active_text_state, existing,
+                file_list_all_html, file_list_flagged_html, status,
+            ],
+        ).then(refresh_annotation_sources, [image_state], source_select)
         source_select.input(
             load_annotation_source,
             [image_state, source_select],
