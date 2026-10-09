@@ -50,7 +50,13 @@ DEFAULT_CONTEXT_SIZE = 4096
 DEFAULT_DATASET_ROOT = r"C:\test\handwriting_ocr\pictures_for_OCR"
 CONFIDENCE_VALUES = {"high", "medium", "low"}
 TABLE_HEADERS = ["ID", "Text", "Konfidenz", "x1_px", "y1_px", "x2_px", "y2_px", "Winkel (°)", "Prüfung"]
-TABLE_DATATYPES = ["str", "str", "str", "number", "number", "number", "number", "number", "str"]
+# Bewusst EIN Typ für alle Spalten statt einer Liste je Spalte: Gradio 6.20
+# berechnet bei einer Liste die Spaltentypen beim Aufbau der Tabelle für
+# JEDE Zelle neu (inkl. Durchlaufen des kompletten Tabelleninhalts). Bei 30
+# Zeilen blockierte das den Browser nach jeder Seitenwahl und jedem
+# Akzeptieren für ca. 9 s, bei 100 Zeilen deutlich länger. Zahlen kommen als
+# Text zurück und werden in table_to_annotation ohnehin per float() gelesen.
+TABLE_DATATYPES = "str"
 TABLE_COLUMN_WIDTHS = ["9%", "37%", "8%", "7%", "7%", "7%", "7%", "7%", "11%"]
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".gif", ".webp"}
 DATASET_FILE_EXTENSIONS = IMAGE_EXTENSIONS | {".pdf"}
@@ -544,6 +550,10 @@ BBOX_STYLE = """
 .bbox-review-accepted { background: rgba(36,161,72,.13); }
 .bbox-review-rejected { background: rgba(218,30,40,.13); border-style: dashed !important; }
 body.qb-hide-accepted .bbox-review-accepted:not(.bbox-selected) { display: none; }
+body.qb-hide-controls .bbox-review, body.qb-hide-controls .bbox-handle, body.qb-hide-controls .bbox-rotate-handle,
+body.qb-hide-controls .bbox-nudge, body.qb-hide-controls .bbox-apply-angle, body.qb-hide-controls .bbox-text,
+body.qb-hide-controls .bbox-label { display: none; }
+body.qb-hide-controls .bbox-box { cursor: pointer; }
 .bbox-review { position: absolute; top: calc(50% - 10px); left: calc(100% + 30px); display: flex; gap: 3px; }
 .bbox-review-left { left: auto; right: calc(100% + 30px); }
 .bbox-review-below { top: calc(100% + 4px); left: auto; right: 0; }
@@ -660,7 +670,11 @@ BBOX_JS = """
     const startX = evt.clientX, startY = evt.clientY;
     const startLeft = box.offsetLeft, startTop = box.offsetTop;
     let moved = false;
+    // Übersichtsmodus ("Bedienelemente ausblenden"): Klick wählt nur aus,
+    // Boxen lassen sich nicht versehentlich verschieben.
+    const viewOnly = document.body.classList.contains('qb-hide-controls');
     function onMove(e) {
+      if (viewOnly) return;
       const dx = e.clientX - startX, dy = e.clientY - startY;
       if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
       const newLeft = qbClamp(startLeft + dx, 0, canvas.clientWidth - box.offsetWidth);
@@ -2821,11 +2835,18 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                             choices=[],
                             interactive=True,
                         )
-                        hide_accepted = gr.Checkbox(
-                            label="Akzeptierte Boxen ausblenden",
-                            info="Farben: grau = offen, grün = akzeptiert, rot = nicht akzeptiert, blau = ausgewählt.",
-                            value=False,
-                        )
+                        with gr.Row():
+                            hide_accepted = gr.Checkbox(
+                                label="Akzeptierte Boxen ausblenden",
+                                info="Farben: grau = offen, grün = akzeptiert, rot = nicht akzeptiert, blau = ausgewählt.",
+                                value=False,
+                            )
+                            hide_controls = gr.Checkbox(
+                                label="Bedienelemente ausblenden (Übersicht)",
+                                info="Nur die Rechtecke zeigen - ohne ✓/✗, Griffe, Nummern und Textfeld. "
+                                "Klick wählt weiter aus, Text beim Überfahren mit der Maus.",
+                                value=False,
+                            )
                         preview = gr.HTML(EMPTY_PREVIEW_HTML, label="Zeilenboxen", elem_id="bbox-preview-wrap")
                         # visible=False would unmount this element in Gradio 6, breaking the
                         # JS->Python bridge from render_interactive_preview; hide via CSS instead
@@ -2956,6 +2977,11 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
         hide_accepted.change(
             None, [hide_accepted], None,
             js="(v) => { document.body.classList.toggle('qb-hide-accepted', !!v); return []; }",
+        )
+        # Reine Anzeige-Umschaltung im Browser, ohne Server-Runde.
+        hide_controls.change(
+            None, [hide_controls], None,
+            js="(v) => { document.body.classList.toggle('qb-hide-controls', !!v); return []; }",
         )
         for review_button, review_fn in (
             (accept_button, accept_selected),
