@@ -242,7 +242,16 @@ if "!FT_NEW_ARCH!"=="1" if "!FT_SUPPORTED!"=="0" (
   set /p FT_REFRESH="Python-Pakete im Image jetzt aktualisieren? Dauert einige Minuten. (J/n): "
   if "!FT_REFRESH!"=="" set "FT_REFRESH=j"
 )
-if /i "!FT_REFRESH!"=="j" set "FT_BUILD_ARGS=--build-arg PACKAGES_REFRESH=%RANDOM%%RANDOM%"
+rem Der Paketstand wird in finetune\.packages_refresh gemerkt und bei jedem Bau
+rem wiederverwendet - sonst wuerde ein wechselnder Wert die Paket-Schicht jedes
+rem Mal neu bauen. Nur eine gewollte Aktualisierung erzeugt einen neuen Wert.
+set "FT_PKG_STAMP=0"
+if exist ".packages_refresh" set /p FT_PKG_STAMP=<".packages_refresh"
+if /i "!FT_REFRESH!"=="j" (
+  set "FT_PKG_STAMP=%DATE:~-4%%RANDOM%%RANDOM%"
+  >".packages_refresh" echo !FT_PKG_STAMP!
+)
+set "FT_BUILD_ARGS=--build-arg PACKAGES_REFRESH=!FT_PKG_STAMP!"
 docker build !FT_BUILD_ARGS! -t handschrift-ocr-finetune:latest .
 if errorlevel 1 (
   echo Bau des Trainings-Images fehlgeschlagen ^(siehe Meldungen oben^).
