@@ -150,6 +150,7 @@ def run_options(
     timeout: int = 1800,
     upscale: bool = False,
     no_mmap: bool = False,
+    json_mode: str = qp.DEFAULT_JSON_MODE,
 ) -> argparse.Namespace:
     """Dieselben Parameter, die qwen_preannotate.run_tile erwartet."""
     if api_url is None:
@@ -164,6 +165,7 @@ def run_options(
         timeout=int(timeout),
         upscale=bool(upscale),
         no_mmap=bool(no_mmap),
+        json_mode=json_mode,
     )
 
 
@@ -226,6 +228,7 @@ def run_model_on_annotation(
             "think": opts.think,
             "upscale": opts.upscale,
             "no_mmap": getattr(opts, "no_mmap", False),
+            "json_mode": getattr(opts, "json_mode", qp.DEFAULT_JSON_MODE),
             "prompt_sha1": hashlib.sha1(qp.PROMPT.encode("utf-8")).hexdigest()[:10],
         },
         "lines": [
@@ -688,6 +691,12 @@ def main() -> None:
     run.add_argument("--ctx", type=qp.positive_int, default=qp.DEFAULT_CONTEXT)
     run.add_argument("--think", action="store_true")
     run.add_argument(
+        "--json-mode",
+        choices=qp.JSON_MODES,
+        default=qp.DEFAULT_JSON_MODE,
+        help="Erzwungenes Antwortformat (siehe qwen_preannotate.py --help); Standard: schema",
+    )
+    run.add_argument(
         "--no-mmap",
         action="store_true",
         help="Modell komplett in den Arbeitsspeicher laden (Ollama use_mmap=false); empfohlen für große Modelle",
@@ -711,7 +720,7 @@ def main() -> None:
 
     opts = run_options(
         args.model, args.max_side, args.ctx, args.think, args.backend, args.api_url, args.timeout, args.upscale,
-        args.no_mmap,
+        args.no_mmap, args.json_mode,
     )
     label = args.label or default_label(opts)
     files = find_annotation_files(args.root)

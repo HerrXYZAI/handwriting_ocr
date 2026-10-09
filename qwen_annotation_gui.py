@@ -323,7 +323,9 @@ def _run_qwen_ollama(path: Path, model: str, context_size: int) -> str:
             "images": [encode_image(path)],
         }],
         "stream": False,
-        "format": "json",
+        # Festes Schema statt nur "json": verhindert Boxen als Text (siehe
+        # qwen_preannotate.LINES_SCHEMA).
+        "format": qwen_preannotate.LINES_SCHEMA,
         # Denkmodus aus: spart bei großen (teilweise auf die CPU ausgelagerten)
         # Modellen viel Zeit; für reine Instruct-Modelle ohne Wirkung.
         "think": False,
@@ -333,6 +335,10 @@ def _run_qwen_ollama(path: Path, model: str, context_size: int) -> str:
     # dieser Zeit fertig sein - bei großen Modellen mit CPU-Auslagerung
     # (z.B. qwen3-vl:30b-a3b-instruct auf 12 GB VRAM) kann das dauern.
     response = requests.post(OLLAMA_API, json=payload, timeout=OLLAMA_TIMEOUT)
+    if not response.ok:
+        # Ältere Ollama-Versionen ohne Schema-Unterstützung.
+        payload["format"] = "json"
+        response = requests.post(OLLAMA_API, json=payload, timeout=OLLAMA_TIMEOUT)
     if not response.ok and "think" in response.text.lower():
         # Ältere Ollama-Version oder Modell ohne Thinking-Unterstützung.
         payload.pop("think")

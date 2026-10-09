@@ -61,6 +61,42 @@ keine Erläuterungen ausgeben.
 
 LOG = logging.getLogger("qwen_preannotate")
 
+# Antwortformat für Ollamas "format"-Parameter. Mit "schema" erzwingt Ollama
+# genau diese Struktur (bbox_1000 = vier Ganzzahlen). Mit dem bloßen "json"
+# ist nur irgendein gültiges JSON erzwungen; große Modelle geraten dabei
+# gelegentlich in einen Text statt einer Zahlenliste (z.B.
+# "bbox_1000":":[102,138,570,180]," ) und brechen die Antwort danach ab.
+JSON_MODES = ("schema", "json", "none")
+DEFAULT_JSON_MODE = "schema"
+LINES_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "lines": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "bbox_1000": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+                    "text": {"type": "string"},
+                    "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "angle": {"type": "number"},
+                },
+                "required": ["bbox_1000", "text", "confidence"],
+            },
+        }
+    },
+    "required": ["lines"],
+}
+
+
+def ollama_format(json_mode: str) -> Any:
+    """Wert für Ollamas "format"-Feld (None = Feld weglassen)."""
+    if json_mode == "schema":
+        return LINES_SCHEMA
+    if json_mode == "json":
+        return "json"
+    return None
+
 
 def configure_logging(log_file: Path, verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -316,16 +352,25 @@ def call_qwen(
     api_url: str,
     think: bool = False,
     no_mmap: bool = False,
+    json_mode: str = DEFAULT_JSON_MODE,
 ) -> dict[str, Any]:
     if backend == "llamacpp":
         return _call_llamacpp(image, model, timeout, tile_index, api_url, think)
-    return _call_ollama(image, model, context, timeout, tile_index, api_url, think, no_mmap)
+    return _call_ollama(image, model, context, timeout, tile_index, api_url, think, no_mmap, json_mode)
 
 
 def _post_ollama_stream(api_url: str, payload: dict[str, Any], timeout: int) -> requests.Response:
     """Sendet die Anfrage; lehnt eine ältere Ollama-Version oder ein Modell den
     Parameter "think" ab, wird einmal ohne ihn wiederholt."""
     response = requests.post(api_url, json=payload, stream=True, timeout=(30, timeout))
+    if not response.ok and isinstance(payload.get("format"), dict):
+        LOG.warning(
+            "Ollama lehnt das JSON-Schema ab (%s); Anfrage wird mit format=json wiederholt.",
+            response.text.strip()[:200],
+        )
+        response.close()
+        payload = {**payload, "format": "json"}
+        response = requests.post(api_url, json=payload, stream=True, timeout=(30, timeout))
     if not response.ok and "think" in payload and "think" in response.text.lower():
         LOG.warning(
             "Ollama akzeptiert den Parameter 'think' für dieses Modell nicht (%s); "
@@ -347,6 +392,7 @@ def _call_ollama(
     api_url: str,
     think: bool = False,
     no_mmap: bool = False,
+    json_mode: str = DEFAULT_JSON_MODE,
 ) -> dict[str, Any]:
     options: dict[str, Any] = {"temperature": 0, "num_ctx": context}
     if no_mmap:
@@ -364,7 +410,6 @@ def _call_ollama(
             "images": [encode_jpeg(image)],
         }],
         "stream": True,
-        "format": "json",
         # Thinking-Modelle (z.B. qwen3-vl:*-thinking) erzeugen sonst vor der
         # eigentlichen Antwort lange Denktexte. Das kostet bei großen, teilweise
         # auf die CPU ausgelagerten Modellen viel Zeit und füllt den Kontext, bevor
@@ -372,6 +417,9 @@ def _call_ollama(
         "think": bool(think),
         "options": options,
     }
+    response_format = ollama_format(json_mode)
+    if response_format is not None:
+        payload["format"] = response_format
     LOG.info(
         "Ollama-Anfrage für Abschnitt %d: URL=%s, Modell=%s, Kontext=%d, Bild=%dx%d, Denken=%s",
         tile_index,
@@ -586,6 +634,7 @@ def run_tile(tile: Tile, args: argparse.Namespace) -> list[dict[str, Any]]:
     result = call_qwen(
         prepared, args.model, args.ctx, args.timeout, tile.index, args.backend, args.api_url, args.think,
         getattr(args, "no_mmap", False),
+        getattr(args, "json_mode", DEFAULT_JSON_MODE),
     )
     raw_lines = result.get("lines", [])
     if not isinstance(raw_lines, list):
@@ -658,6 +707,7 @@ def build_processing_block(args: argparse.Namespace, log_file: Path, tile_count:
         "context_size": args.ctx,
         "think": args.think,
         "no_mmap": args.no_mmap,
+        "json_mode": args.json_mode,
         "max_model_image_side": args.max_side,
         "tile_trigger": args.tile_trigger,
         "tile_size": args.tile_size,
@@ -922,6 +972,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CONTEXT,
         help=f"Ollama-Kontextgröße; Standard: {DEFAULT_CONTEXT}. Bei --max-side 1536 und "
         "vollen Seiten ggf. 12288.",
+    )
+    parser.add_argument(
+        "--json-mode",
+        choices=JSON_MODES,
+        default=DEFAULT_JSON_MODE,
+        help="Erzwungenes Antwortformat bei Ollama: 'schema' (Standard; feste Struktur, "
+        "bbox_1000 immer vier Zahlen), 'json' (nur gültiges JSON, früheres Verhalten) oder "
+        "'none' (kein Zwang, JSON wird aus dem Text gelesen).",
     )
     parser.add_argument(
         "--no-mmap",
