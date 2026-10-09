@@ -40,6 +40,20 @@ ollama list
 
 Den exakten Namen aus `ollama list` in der Oberfläche eintragen.
 
+Einfacher über `run.bat`:
+
+- **11 – Neues Modell in Ollama herunterladen:** Namen einfügen, z.B. `qwen3-vl:8b`. Es
+  geht auch der komplette Befehl (`ollama pull …`, `docker exec … ollama pull …`) oder der
+  Link von ollama.com bzw. Hugging Face. Mit Fortschrittsanzeige; anschließend wird
+  geprüft, ob das Modell Bilder verarbeiten kann, und es lässt sich als Standard für die
+  Vorannotation vormerken.
+- **12 – Modell aus Ollama löschen:** Liste der installierten Modelle mit Größe; eine oder
+  mehrere Nummern wählen (`3`, `1,4`, `2-5`), Rückfrage vor dem Löschen. Vorannotationen
+  dieser Modelle in den JSON-Dateien bleiben erhalten.
+
+Beides spricht direkt mit der Ollama-API (`http://127.0.0.1:11434`, änderbar über
+`OLLAMA_HOST_URL`) und funktioniert für lokal installiertes Ollama und den Docker-Container.
+
 ## Größere Modelle als der Grafikspeicher (CPU-Auslagerung)
 
 Ein Modell, das nicht vollständig in den VRAM passt (z.B. 12 GB Grafikkarte), kann

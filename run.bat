@@ -59,10 +59,12 @@ echo  7. Trainings-Datensatz exportieren (qwen_export_dataset.py)
 echo  8. Finetuning starten (Docker, in finetune\)
 echo  9. Adapter mit Basismodell zusammenfuehren (Docker, finetune\merge.sh)
 echo 10. Zurueck nach Ollama (GGUF konvertieren, quantisieren, importieren)
-echo 11. Beenden
+echo 11. Neues Modell in Ollama herunterladen (Namen einfuegen)
+echo 12. Modell aus Ollama loeschen
+echo 13. Beenden
 echo ===================================================
 set "CHOICE="
-set /p CHOICE="Auswahl (1-11, Enter = 1): "
+set /p CHOICE="Auswahl (1-13, Enter = 1): "
 if "%CHOICE%"=="" set "CHOICE=1"
 
 if "%CHOICE%"=="1" goto :gui
@@ -75,7 +77,9 @@ if "%CHOICE%"=="7" goto :export
 if "%CHOICE%"=="8" goto :finetune
 if "%CHOICE%"=="9" goto :merge_adapter
 if "%CHOICE%"=="10" goto :to_ollama
-if "%CHOICE%"=="11" goto :eof
+if "%CHOICE%"=="11" goto :ollama_pull
+if "%CHOICE%"=="12" goto :ollama_delete
+if "%CHOICE%"=="13" goto :eof
 goto :menu
 
 :gui
@@ -352,6 +356,16 @@ set "TO_OLLAMA_ARGS=-MergedDir "%MERGED_DIR%""
 if not "%OLLAMA_MODEL_NAME%"=="" set "TO_OLLAMA_ARGS=%TO_OLLAMA_ARGS% -ModelName "%OLLAMA_MODEL_NAME%""
 if not "%OLLAMA_QUANT%"=="" set "TO_OLLAMA_ARGS=%TO_OLLAMA_ARGS% -Quant "%OLLAMA_QUANT%""
 powershell -ExecutionPolicy Bypass -File finetune\to_ollama.ps1 !TO_OLLAMA_ARGS!
+goto :done
+
+:ollama_pull
+rem Spricht direkt mit der Ollama-API (Port 11434) - funktioniert damit fuer
+rem lokal installiertes Ollama und fuer den Docker-Container gleichermassen.
+"%PYEXE%" ollama_models.py pull
+goto :done
+
+:ollama_delete
+"%PYEXE%" ollama_models.py delete
 goto :done
 
 :done
