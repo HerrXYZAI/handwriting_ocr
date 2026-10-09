@@ -134,7 +134,8 @@ damit das Modell genau das geprüfte Bild sieht.
 auf allen geprüften Seiten ohne diesen Lauf ausführen, Übersichtstabelle berechnen und
 eine Seite im Detail ansehen: zwei Läufe nebeneinander mit Referenzboxen (grün) und
 Modellboxen (gestrichelt; rot "+" = Zeile ohne Referenz) sowie ein zeilenweiser
-Text-Diff (rot = fehlt/falsch, grün = stattdessen vom Modell geschrieben).
+Text-Diff (rot = fehlt/falsch, grün = stattdessen vom Modell geschrieben). Mit der Maus über eine Box
+zeigt den erkannten Text (bei Modellboxen zusammen mit der zugeordneten Referenzzeile).
 
 **Kommandozeile** (empfohlen für lange Stapelläufe mit großen Modellen, auch über
 `run.bat`, Punkt 5; die Oberfläche direkt im Vergleichsreiter startet Punkt 2 bzw. `python qwen_annotation_gui.py --tab vergleich`). Seiten mit vorhandenem Lauf werden übersprungen, ein Abbruch mit
@@ -220,6 +221,21 @@ wenn ihre `_preannotation.json` schon existiert. `--output`/`--log-file` sind be
 Ordner nicht zulässig, da die Namen je Datei automatisch vergeben werden. Ein Fehler bei
 einer Datei bricht den Ordnerlauf nicht ab; die Datei wird mit Fehlermeldung übersprungen
 und mit den restlichen Dateien fortgefahren.
+
+## Vorannotationen mehrerer Modelle
+
+Jede Vorannotation wird je Modell gespeichert, sowohl aus der Oberfläche als auch aus
+`qwen_preannotate.py`: in `<bild>_preannotation.json` unter `model_runs`
+(die obersten `lines` bleiben der zuletzt erzeugte Stand). Ein Lauf mit einem anderen
+`--model` verarbeitet deshalb auch bereits vorannotierte Seiten und ergänzt sein
+Ergebnis; nur Seiten, die schon einen Lauf mit **demselben** Modell haben, werden
+übersprungen (`--force` erzwingt eine Wiederholung).
+
+Im Reiter *Annotation* wählt das Feld **"Angezeigt"** über der Vorschau, welche Fassung
+in Tabelle und Vorschau geladen wird: die geprüfte Annotation, die Vorannotation eines
+bestimmten Modells oder ein Vergleichslauf aus dem Reiter *Modellvergleich*. Wird eine
+Vorannotation oder ein Vergleichslauf auf einer bereits geprüften Seite gespeichert,
+ersetzt sie die geprüfte Annotation (die Statuszeile weist darauf hin).
 
 ## Workflow
 

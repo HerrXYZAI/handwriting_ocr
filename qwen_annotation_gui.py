@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
+import datetime
 import io
 import json
 import math
@@ -10,6 +11,7 @@ import mimetypes
 import os
 import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -19,6 +21,7 @@ import requests
 from PIL import Image, ImageOps
 
 import model_compare
+import model_runs
 import qwen_preannotate
 import pdf_utils
 import tesseract_boxes
@@ -994,11 +997,56 @@ def table_to_annotation(table: Any, annotation: dict[str, Any], image_path: str 
     return result
 
 
+def store_gui_preannotation(
+    image_path: str, model: str, context: int, annotation: dict[str, Any], duration: float
+) -> str:
+    """Legt eine in der Oberfläche erzeugte Vorannotation zusätzlich in
+    <bild>_preannotation.json unter model_runs[<modell>] ab (wie
+    qwen_preannotate.py), damit sie später im Auswahlfeld "Angezeigt" wieder
+    wählbar ist - auch wenn danach ein anderes Modell vorannotiert. Bilder, die
+    nur in Gradios Temp-Ordner liegen (manueller Upload), werden übersprungen."""
+    path = Path(image_path)
+    if "gradio" in {part.lower() for part in path.parts} or not path.is_file():
+        return ""
+    target = path.with_name(path.stem + "_preannotation.json")
+    lines = [
+        {
+            "id": line.get("id", f"line_{index:04d}"),
+            "bbox_pixels": line["bbox_pixels"],
+            "bbox_1000": line.get("bbox_1000"),
+            "text": line.get("text_predicted", ""),
+            "confidence": line.get("confidence", "low"),
+            "angle": line.get("angle", 0.0),
+        }
+        for index, line in enumerate(annotation.get("lines", []), 1)
+    ]
+    image = annotation.get("image", {})
+    processing = {"model": model.strip(), "context_size": context, "backend": BACKEND, "source": "gui"}
+    document = {
+        "schema_version": "1.3",
+        "task": "handwritten_line_preannotation",
+        "coordinate_system": "original_pixels",
+        "image": image,
+        "processing": processing,
+        "lines": lines,
+        "errors": [],
+    }
+    try:
+        run = model_runs.make_run(model.strip(), lines, (image.get("width", 0), image.get("height", 0)), processing, duration)
+        model_runs.add_preannotation_run(target, model.strip(), run, document)
+    except OSError as exc:
+        return f" (Vorannotation konnte nicht gespeichert werden: {exc})"
+    return f" Gespeichert als Vorannotation '{model.strip()}'."
+
+
 def start_preannotation(image_path: str | None, model: str, context: int):
     if not image_path:
         raise gr.Error("Bitte zuerst einen Scan auswählen.")
     try:
+        started = time.monotonic()
         annotation = add_metadata(run_qwen(image_path, model, context), image_path, model)
+        duration = time.monotonic() - started
+        stored_note = store_gui_preannotation(image_path, model, int(context), annotation, duration)
         selected = 0 if annotation["lines"] else -1
         return (
             annotation,
@@ -1008,7 +1056,7 @@ def start_preannotation(image_path: str | None, model: str, context: int):
             crop_line(image_path, annotation, selected),
             annotation_to_table(annotation),
             None,
-            f"{len(annotation['lines'])} Zeilen erkannt.",
+            f"{len(annotation['lines'])} Zeilen erkannt.{stored_note}",
         )
     except requests.ConnectionError as exc:
         raise gr.Error("Ollama ist unter 127.0.0.1:11434 nicht erreichbar.") from exc
@@ -1218,6 +1266,15 @@ def load_annotation(image_path: str | None, json_path: str | None):
         raise gr.Error("Bitte Scan und Annotations-JSON auswählen.")
     try:
         data = json.loads(Path(json_path).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise gr.Error(f"Laden fehlgeschlagen: {exc}") from exc
+    return load_annotation_data(image_path, data)
+
+
+def load_annotation_data(image_path: str, data: dict[str, Any], status_note: str = ""):
+    """Gemeinsamer Ladeweg für eine gespeicherte Annotation, eine
+    Vorannotation eines bestimmten Modells oder einen Vergleichslauf."""
+    try:
         if not data.get("schema_version"):
             data = normalize_annotation(data)
 
@@ -1243,10 +1300,132 @@ def load_annotation(image_path: str | None, json_path: str | None):
             crop_line(image_path, data, selected),
             annotation_to_table(data),
             None,
-            f"{len(data.get('lines', []))} Zeilen geladen.",
+            f"{len(data.get('lines', []))} Zeilen geladen.{status_note}",
         )
     except Exception as exc:
         raise gr.Error(f"Laden fehlgeschlagen: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Auswahl, welche (Vor-)Annotation im Reiter "Annotation" angezeigt wird
+# ---------------------------------------------------------------------------
+
+SOURCE_ANNOTATION = "annotation"
+
+
+def _source_files(image_path: str) -> tuple[Path, Path]:
+    path = Path(image_path)
+    return path.with_name(path.stem + "_annotation.json"), path.with_name(path.stem + "_preannotation.json")
+
+
+def _safe_load(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        return model_runs.load_json(path)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _when(run: dict[str, Any]) -> str:
+    created = run.get("created")
+    if not created:
+        return ""
+    try:
+        stamp = datetime.datetime.fromisoformat(str(created))
+    except ValueError:
+        return ""
+    return f"  ({stamp:%d.%m. %H:%M})"
+
+
+def annotation_sources(image_path: str | None) -> tuple[list[tuple[str, str]], str | None]:
+    """Auswahlmöglichkeiten für das Feld "Angezeigt": geprüfte Annotation,
+    Vorannotationen je Modell (_preannotation.json) und Vergleichsläufe
+    (model_runs der geprüften Datei). Standard = was auch automatisch geladen
+    wird (geprüfte Annotation, sonst die zuletzt erzeugte Vorannotation)."""
+    if not image_path:
+        return [], None
+    annotation_path, preannotation_path = _source_files(image_path)
+    choices: list[tuple[str, str]] = []
+    default = None
+    annotation = _safe_load(annotation_path)
+    if annotation is not None:
+        choices.append(("Geprüfte Annotation (gespeichert)", SOURCE_ANNOTATION))
+        default = SOURCE_ANNOTATION
+    preannotation = _safe_load(preannotation_path)
+    if preannotation is not None:
+        runs = model_runs.preannotation_runs(preannotation)
+        ordered = sorted(runs.items(), key=lambda item: str(item[1].get("created") or ""), reverse=True)
+        for label, run in ordered:
+            choices.append((f"Vorannotation: {label}{_when(run)}", f"pre:{label}"))
+        if default is None and ordered:
+            latest = (preannotation.get("processing") or {}).get("model")
+            default = f"pre:{latest}" if latest in runs else f"pre:{ordered[0][0]}"
+    if annotation is not None:
+        for label, run in sorted(model_runs.get_runs(annotation).items()):
+            choices.append((f"Vergleichslauf: {label}{_when(run)}", f"cmp:{label}"))
+    return choices, default
+
+
+def refresh_annotation_sources(image_path: str | None, selected: str | None = None):
+    choices, default = annotation_sources(image_path)
+    values = [value for _, value in choices]
+    value = selected if selected in values else default
+    return gr.update(choices=choices, value=value)
+
+
+def _run_as_annotation(run: dict[str, Any], image: dict[str, Any] | None) -> dict[str, Any]:
+    lines = sorted(
+        (line for line in run.get("lines", []) if isinstance(line, dict) and line.get("bbox_pixels")),
+        key=lambda line: (line["bbox_pixels"][1], line["bbox_pixels"][0]),
+    )
+    size = run.get("image_size") or [0, 0]
+    stored_image = dict(image) if isinstance(image, dict) else {}
+    if size and size[0] and size[1]:
+        stored_image.update({"width": int(size[0]), "height": int(size[1])})
+    return {
+        "schema_version": "1.3",
+        "coordinate_system": "original_pixels",
+        "image": stored_image,
+        "lines": [
+            {
+                "id": f"line_{index:04d}",
+                "bbox_pixels": line["bbox_pixels"],
+                "text": line.get("text", ""),
+                "confidence": line.get("confidence", "low"),
+                "angle": line.get("angle", 0.0),
+            }
+            for index, line in enumerate(lines, 1)
+        ],
+    }
+
+
+def load_annotation_source(image_path: str | None, source: str | None):
+    """Lädt die im Feld "Angezeigt" gewählte Quelle in Tabelle und Vorschau."""
+    if not image_path or not source:
+        raise gr.Error("Bitte zuerst einen Scan laden.")
+    annotation_path, preannotation_path = _source_files(image_path)
+    if source == SOURCE_ANNOTATION:
+        return load_annotation(image_path, str(annotation_path))
+    kind, _, label = source.partition(":")
+    if kind == "pre":
+        data = _safe_load(preannotation_path) or {}
+        runs = model_runs.preannotation_runs(data)
+        note = f" Vorannotation von '{label}'."
+        if annotation_path.is_file():
+            note += " Achtung: Speichern ersetzt die bereits geprüfte Annotation dieser Seite."
+    elif kind == "cmp":
+        data = _safe_load(annotation_path) or {}
+        runs = model_runs.get_runs(data)
+        note = (
+            f" Vergleichslauf '{label}' (ungeprüft). Achtung: Speichern ersetzt die geprüfte "
+            "Annotation dieser Seite durch diese Zeilen."
+        )
+    else:
+        raise gr.Error(f"Unbekannte Auswahl: {source}")
+    if label not in runs:
+        raise gr.Error(f"'{label}' ist für diese Seite nicht mehr vorhanden.")
+    return load_annotation_data(image_path, _run_as_annotation(runs[label], data.get("image")), note)
 
 
 def select_row(table: Any, annotation: dict[str, Any], image_path: str, evt: gr.SelectData):
@@ -2176,6 +2355,13 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
                         existing = gr.File(label="Vorhandene Annotation", file_types=[".json"], type="filepath")
                         load = gr.Button("Scan und JSON laden")
                     with gr.Column(scale=2):
+                        source_select = gr.Dropdown(
+                            label="Angezeigt: geprüfte Annotation oder Vorannotation welches Modells",
+                            info="Wechsel lädt die gewählte Fassung in Tabelle und Vorschau "
+                            "(ungespeicherte Änderungen gehen verloren).",
+                            choices=[],
+                            interactive=True,
+                        )
                         preview = gr.HTML(EMPTY_PREVIEW_HTML, label="Zeilenboxen", elem_id="bbox-preview-wrap")
                         # visible=False would unmount this element in Gradio 6, breaking the
                         # JS->Python bridge from render_interactive_preview; hide via CSS instead
@@ -2225,7 +2411,20 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
             [tile_paths_state, tile_number],
             [image, image_state, annotation_state, selected_state, preview, crop, table, active_text_state, existing, status],
         )
-        preannotate.click(start_preannotation, [image, model, context], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status])
+        preannotate.click(start_preannotation, [image, model, context], [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status]).then(
+            lambda path, name: refresh_annotation_sources(path, f"pre:{(name or '').strip()}"),
+            [image_state, model],
+            source_select,
+        )
+        # Auswahlfeld bei jedem Bildwechsel neu füllen; .input (nicht .change),
+        # damit nur eine echte Auswahl durch den Benutzer neu lädt, nicht das
+        # programmgesteuerte Setzen des Werts.
+        image_state.change(refresh_annotation_sources, [image_state], source_select)
+        source_select.input(
+            load_annotation_source,
+            [image_state, source_select],
+            [annotation_state, image_state, selected_state, preview, crop, table, active_text_state, status],
+        )
         tesseract_button.click(
             apply_tesseract_boxes,
             [table, annotation_state, image_state, tesseract_lang, tesseract_psm],
@@ -2287,6 +2486,8 @@ def build_interface(initial_tab: str = "annotation") -> gr.Blocks:
             save_annotation,
             [table, annotation_state, image_state, model, dataset_root],
             [annotation_state, annotation_file, status, image_state, file_list_all_html, file_list_flagged_html],
+        ).then(
+            lambda path: refresh_annotation_sources(path, SOURCE_ANNOTATION), [image_state], source_select
         )
         export_button.click(export_jsonl, [table, annotation_state, image_state, dataset_root, export_mode], [annotation_state, training_file, status, image_state])
         refresh_files_button.click(render_file_lists, [dataset_root, image_state], [file_list_all_html, file_list_flagged_html])

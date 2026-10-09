@@ -19,6 +19,7 @@ import pdf_utils
 import tesseract_boxes
 from tiling import Tile, create_tiles, save_tiles
 from console import run_main, tprint
+import model_runs
 
 OLLAMA_API = os.environ.get("OLLAMA_API", "http://127.0.0.1:11434/api/chat")
 LLAMACPP_API = os.environ.get("LLAMACPP_API", "http://127.0.0.1:8080/v1/chat/completions")
@@ -817,8 +818,8 @@ def process_page(args: argparse.Namespace, source: Path) -> list[Path]:
 
     output, log_file = resolve_page_paths(args, source)
 
-    if len(tiles) == 1 and output.is_file() and not args.force:
-        tprint(f"Bereits vorhanden, übersprungen: {output}")
+    if len(tiles) == 1 and not args.force and model_runs.has_preannotation_run(output, args.model):
+        tprint(f"Vorannotation mit '{args.model}' bereits vorhanden, übersprungen: {output}")
         return [output]
 
     configure_logging(log_file, args.verbose)
@@ -842,6 +843,7 @@ def process_untiled_page(
     page_height: int,
 ) -> Path:
     errors: list[dict[str, Any]] = []
+    started = time.monotonic()
     try:
         lines = finalize_lines(run_tile(tile, args))
     except Exception as error:
@@ -850,6 +852,7 @@ def process_untiled_page(
         if not args.continue_on_error:
             raise
         lines = []
+    duration = time.monotonic() - started
 
     lines = maybe_adjust_with_tesseract(args, source, lines, page_width, page_height)
 
@@ -867,7 +870,7 @@ def process_untiled_page(
         "lines": lines,
         "errors": errors,
     }
-    output.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_preannotation(output, document, args, lines, (page_width, page_height), duration, errors)
     LOG.info("Gespeichert: %s", output)
     LOG.info("Erkannte Zeilen: %d", len(lines))
     return output
@@ -887,12 +890,15 @@ def process_tiled_page(
 
     for tile, tile_image_path in zip(tiles, tile_paths):
         tile_output_path = tile_image_path.with_name(tile_image_path.stem + "_preannotation.json")
-        if tile_output_path.is_file() and not args.force:
-            LOG.info("Abschnitt %d bereits vorhanden, übersprungen: %s", tile.index, tile_output_path)
+        if not args.force and model_runs.has_preannotation_run(tile_output_path, args.model):
+            LOG.info(
+                "Abschnitt %d mit '%s' bereits vorhanden, übersprungen: %s", tile.index, args.model, tile_output_path
+            )
             outputs.append(tile_output_path)
             continue
 
         errors: list[dict[str, Any]] = []
+        started = time.monotonic()
         try:
             lines = finalize_lines(run_tile(tile, args))
         except Exception as error:
@@ -901,6 +907,7 @@ def process_tiled_page(
             if not args.continue_on_error:
                 raise
             lines = []
+        duration = time.monotonic() - started
 
         tile_width, tile_height = tile.image.size
         lines = maybe_adjust_with_tesseract(args, tile_image_path, lines, tile_width, tile_height)
@@ -926,12 +933,40 @@ def process_tiled_page(
             "lines": lines,
             "errors": errors,
         }
-        tile_output_path.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+        save_preannotation(tile_output_path, document, args, lines, (tile_width, tile_height), duration, errors)
         LOG.info("Abschnitt %d gespeichert: %s (%d Zeilen)", tile.index, tile_output_path, len(lines))
         outputs.append(tile_output_path)
 
     LOG.info("Alle Abschnitte gespeichert: %d Datei(en) in %s", len(outputs), tile_dir)
     return outputs
+
+
+def save_preannotation(
+    path: Path,
+    document: dict[str, Any],
+    args: argparse.Namespace,
+    lines: list[dict[str, Any]],
+    image_size: tuple[int, int],
+    duration: float,
+    errors: list[dict[str, Any]],
+) -> None:
+    """Schreibt die Vorannotation und legt den Lauf zusätzlich unter
+    model_runs[<modell>] ab, ohne Läufe anderer Modelle in derselben Datei zu
+    verlieren (Auswahl in der GUI). Fehlgeschlagene Läufe werden nicht unter
+    model_runs eingetragen, damit sie beim nächsten Aufruf wiederholt werden."""
+    if errors:
+        existing = {}
+        if path.is_file():
+            try:
+                existing = model_runs.preannotation_runs(model_runs.load_json(path))
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+        if existing:
+            document = {**document, model_runs.RUNS_KEY: existing}
+        model_runs.write_json_atomic(path, document)
+        return
+    run = model_runs.make_run(args.model, lines, image_size, document.get("processing"), duration)
+    model_runs.add_preannotation_run(path, args.model, run, document)
 
 
 def percentage(value: str) -> float:
@@ -1024,11 +1059,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Bereits vorhandene Vorannotationen (je Seite/Kachel) erneut erzeugen statt sie "
-        "zu überspringen. Ohne diese Option wird jede Seite/Kachel einzeln übersprungen, "
-        "deren _preannotation.json schon existiert - so lässt sich ein abgebrochener oder "
-        "erweiterter Lauf (Einzeldatei, PDF, Kacheln oder Ordner) fortsetzen, ohne bereits "
-        "fertige Seiten/Kacheln erneut an Qwen zu schicken.",
+        help="Bereits vorhandene Vorannotationen dieses Modells (je Seite/Kachel) erneut "
+        "erzeugen statt sie zu überspringen. Ohne diese Option wird jede Seite/Kachel "
+        "übersprungen, deren _preannotation.json schon einen Lauf mit demselben --model "
+        "enthält - so lässt sich ein abgebrochener Lauf fortsetzen. Ein anderes Modell "
+        "läuft dagegen auch auf bereits vorannotierten Seiten; seine Ergebnisse werden "
+        "zusätzlich unter model_runs gespeichert und sind in der GUI auswählbar.",
     )
     parser.add_argument(
         "--tesseract-adjust",

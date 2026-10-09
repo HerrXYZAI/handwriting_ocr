@@ -537,7 +537,9 @@ def _encode_display_image(image: Image.Image, max_dim: int = 1200) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _box_div(box: list[float], width: int, height: int, color: str, label: str, dashed: bool, angle: float) -> str:
+def _box_div(
+    box: list[float], width: int, height: int, color: str, label: str, dashed: bool, angle: float, tooltip: str = ""
+) -> str:
     x1, y1, x2, y2 = box
     style = (
         f"left:{x1 / width * 100:.3f}%;top:{y1 / height * 100:.3f}%;"
@@ -547,10 +549,17 @@ def _box_div(box: list[float], width: int, height: int, color: str, label: str, 
     if angle:
         style += f"transform:rotate({angle:.2f}deg);"
     tag_pos = "bottom:-18px;right:-2px;" if dashed else "top:-18px;left:-2px;"
+    tip = f"<span class='mc-tip'>{tooltip}</span>" if tooltip else ""
     return (
-        f"<div class='mc-box' style='{style}'>"
-        f"<span class='mc-tag' style='background:{color};{tag_pos}'>{_esc(label)}</span></div>"
+        f"<div class='mc-box{' mc-pred' if dashed else ''}' style='{style}'>"
+        f"<span class='mc-tag' style='background:{color};{tag_pos}'>{_esc(label)}</span>{tip}</div>"
     )
+
+
+def _tip_line(caption: str, text: str, color: str) -> str:
+    # Farben inline: Gradios HTML-Komponente überschreibt sonst die Textfarbe
+    # (dunkler Text auf dem dunklen Hinweisfeld wäre unsichtbar).
+    return f"<b style='color:{color}'>{_esc(caption)}</b> <span style='color:#fff'>{_esc(text)}</span>"
 
 
 def overlay_html(
@@ -564,14 +573,39 @@ def overlay_html(
     image = qp.open_scan(image_path)
     width, height = image.size
     ref = reference_lines(data)
-    parts = [_box_div(line["box"], width, height, REF_COLOR, str(i + 1), False, line["angle"]) for i, line in enumerate(ref)]
+    pred: list[dict[str, Any]] = []
+    matched: dict[int, tuple[int, float]] = {}
+    extra: set[int] = set()
     if run is not None:
         pred = run_lines(run)
         matched, extra = match_lines(ref, pred, threshold)
-        pred_to_ref = {pi: ri for ri, (pi, _) in matched.items()}
-        for pi, line in enumerate(pred):
-            tag = str(pred_to_ref[pi] + 1) if pi in pred_to_ref else "+"
-            parts.append(_box_div(line["box"], width, height, color if pi not in extra else "#DA1E28", tag, True, line["angle"]))
+    # Mouse-over: erkannter Text je Box. Referenzboxen zeigen zusätzlich, was
+    # das Modell dort gelesen hat; Modellboxen zusätzlich die Referenz - so ist
+    # der Vergleich auch dann sichtbar, wenn eine Box die andere überdeckt.
+    parts = []
+    for ri, line in enumerate(ref):
+        tip = [_tip_line(f"Referenz {ri + 1}:", line["text"], REF_COLOR)]
+        if run is not None:
+            if ri in matched:
+                pi, overlap = matched[ri]
+                tip.append(_tip_line("Modell:", pred[pi]["text"], color) + f" <i style='color:#bbb'>(IoU {overlap:.2f})</i>")
+            else:
+                tip.append(_tip_line("Modell:", "— keine passende Box", color))
+        parts.append(_box_div(line["box"], width, height, REF_COLOR, str(ri + 1), False, line["angle"], "<br>".join(tip)))
+    pred_to_ref = {pi: (ri, overlap) for ri, (pi, overlap) in matched.items()}
+    for pi, line in enumerate(pred):
+        box_color = color if pi not in extra else "#DA1E28"
+        if pi in pred_to_ref:
+            ri, overlap = pred_to_ref[pi]
+            tag = str(ri + 1)
+            tip = [
+                _tip_line("Modell:", line["text"], box_color) + f" <i style='color:#bbb'>(IoU {overlap:.2f})</i>",
+                _tip_line(f"Referenz {ri + 1}:", ref[ri]["text"], REF_COLOR),
+            ]
+        else:
+            tag = "+"
+            tip = [_tip_line("Modell:", line["text"], box_color), "<i style='color:#bbb'>keine Referenzzeile an dieser Stelle</i>"]
+        parts.append(_box_div(line["box"], width, height, box_color, tag, True, line["angle"], "<br>".join(tip)))
     legend = (
         f"<div class='mc-legend'><b>{_esc(title)}</b> &nbsp; "
         f"<span style='color:{REF_COLOR}'>━ Referenz</span> &nbsp; "
@@ -643,7 +677,14 @@ COMPARE_STYLE = """
 <style>
 .mc-canvas { position: relative; display: inline-block; max-width: 100%; line-height: 0; }
 .mc-image { display: block; width: 100%; height: auto; }
-.mc-box { position: absolute; box-sizing: border-box; pointer-events: none; transform-origin: 50% 50%; }
+.mc-box { position: absolute; box-sizing: border-box; transform-origin: 50% 50%; cursor: help; }
+.mc-box:hover { z-index: 30; background: rgba(255,255,255,.12); }
+.mc-tip { display: none; position: absolute; left: 0; top: 100%; margin-top: 4px; z-index: 31;
+          background: rgba(25,25,25,.94); color: #fff; font: 13px/1.45 sans-serif; padding: 5px 8px;
+          border-radius: 5px; width: max-content; max-width: 460px; white-space: normal;
+          box-shadow: 0 2px 8px rgba(0,0,0,.35); pointer-events: none; }
+.mc-pred .mc-tip { top: auto; bottom: 100%; margin: 0 0 4px; }
+.mc-box:hover .mc-tip { display: block; }
 .mc-tag { position: absolute; color: #fff; font: bold 11px/1.4 sans-serif; padding: 0 4px; border-radius: 3px; white-space: nowrap; }
 .mc-legend { font-size: 13px; margin: 4px 0 8px; line-height: 1.5; }
 .mc-table { border-collapse: collapse; width: 100%; font-size: 14px; }
